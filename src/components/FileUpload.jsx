@@ -1,7 +1,9 @@
 import React, { useRef, useEffect, useState, useCallback } from 'react'
-import { deleteEdfRecord, listEdfRecords } from '../utils/edfStorage'
+import { buildEdfSummary, deleteEdfRecord, findEdfRecordsByFileName, listEdfRecords, saveEdfRecord } from '../utils/edfStorage'
+import { parseEdfFile } from '../utils/edfParser'
 
-const TEST_EDF_URL = '/testEDF/1779335171431389.edf'
+const TEST_EDF_FILE_NAME = 'test.edf'
+const TEST_EDF_URL = `${import.meta.env.BASE_URL}${TEST_EDF_FILE_NAME}`
 
 function formatDuration(seconds) {
   const hours = Math.floor(seconds / 3600)
@@ -69,14 +71,27 @@ const FileUpload = ({ onFileUpload, onLoadSavedEdf, isLoading, error }) => {
   }
 
   const handleLoadTestFile = async () => {
+    setSavedError('')
+    setSavedMessage('')
+
     try {
+      const existingRecords = await findEdfRecordsByFileName(TEST_EDF_FILE_NAME)
+      if (existingRecords.length > 0) {
+        await onLoadSavedEdf(existingRecords[0].id)
+        return
+      }
+
       const response = await fetch(TEST_EDF_URL)
       if (!response.ok) {
         throw new Error(`Test EDF not found (${response.status})`)
       }
+
       const buffer = await response.arrayBuffer()
-      const file = new File([buffer], '1779335171431389.edf', { type: 'application/octet-stream' })
-      onFileUpload(file)
+      const parsed = await parseEdfFile(buffer)
+      const summary = buildEdfSummary(parsed)
+      const recordId = await saveEdfRecord(TEST_EDF_FILE_NAME, buffer, summary)
+      await refreshSavedRecords()
+      await onLoadSavedEdf(recordId)
     } catch (loadError) {
       alert(loadError.message || 'Failed to load test EDF file')
     }

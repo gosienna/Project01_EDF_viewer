@@ -37,7 +37,24 @@ body {
   max-width: 1200px;
   margin: 0 auto;
   padding: 0 2rem;
+  position: relative;
   text-align: center;
+}
+
+.header-bmc-button {
+  position: absolute;
+  top: 50%;
+  right: 2rem;
+  transform: translateY(-50%);
+  z-index: 2;
+  min-width: 210px;
+}
+
+.header-bmc-button .bmc-btn {
+  height: 48px !important;
+  min-width: 180px !important;
+  padding: 0 16px !important;
+  font-size: 20px !important;
 }
 
 .logo {
@@ -1389,5 +1406,11 @@ body.signal-viewer-y-panning {
   
   .logo-icon {
     font-size: 2rem;
+  }
+
+  .header-bmc-button {
+    top: 0.75rem;
+    right: 1rem;
+    transform: none;
   }
 }
