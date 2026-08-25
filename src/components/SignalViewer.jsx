@@ -1,4 +1,12 @@
 import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react'
+import {
+  ANNOTATION_CHANNEL_ID_BASE,
+  buildAnnotationChannels,
+  buildDefaultAnnotationGroups,
+  getUniqueAnnotationLabels,
+  normalizeAnnotationGroups,
+  serializeAnnotationGroups,
+} from '../utils/annotationChannels'
 import { deleteViewPreset, listViewPresets, saveViewPreset, updateViewPresetById } from '../utils/viewPresets'
 import { deleteBinaryMaskEdit, getBinaryMaskEdits, saveBinaryMaskEdit } from '../utils/binaryMaskStorage'
 import { buildEdfSummary, deleteEdfRecord, findEdfRecordsByFileName, saveEdfRecord, updateEdfRecord } from '../utils/edfStorage'
@@ -86,17 +94,57 @@ function formatDuration(seconds) {
   return `${secs}s`
 }
 
+function getPhysiologicalChannels(channels) {
+  return channels.filter((ch) => !ch.isAnnotationChannel)
+}
+
 function getDefaultSelection(channels) {
-  const preferred = channels
+  const physiological = getPhysiologicalChannels(channels)
+  const preferred = physiological
     .filter((ch) => DEFAULT_CHANNELS.includes(ch.label.toLowerCase()))
     .map((ch) => ch.id)
 
   if (preferred.length > 0) return preferred
 
-  return channels
-    .filter((ch) => !ch.label.toLowerCase().includes('annotation'))
-    .slice(0, 5)
-    .map((ch) => ch.id)
+  return physiological.slice(0, 5).map((ch) => ch.id)
+}
+
+function isAnnotationChannelId(channelId) {
+  return Number(channelId) >= ANNOTATION_CHANNEL_ID_BASE
+}
+
+function resolveAnnotationBundle(edfData, annotationGroups, totalDuration) {
+  const uniqueLabels = getUniqueAnnotationLabels(edfData.annotations ?? [])
+  const groups = normalizeAnnotationGroups(annotationGroups, uniqueLabels)
+  const annotationChannels = buildAnnotationChannels(
+    edfData.annotations ?? [],
+    totalDuration ?? edfData.totalDuration ?? 0,
+    groups
+  )
+  return {
+    uniqueLabels,
+    groups,
+    annotationChannels,
+    allChannels: [...edfData.channels, ...annotationChannels],
+  }
+}
+
+function remapSelectedChannelIds(previousIds, previousChannels, nextChannels) {
+  const previousById = Object.fromEntries((previousChannels ?? []).map((ch) => [ch.id, ch]))
+  const nextByLabel = Object.fromEntries((nextChannels ?? []).map((ch) => [ch.label, ch.id]))
+  const remapped = []
+  const seen = new Set()
+
+  for (const id of previousIds ?? []) {
+    const previous = previousById[id]
+    if (!previous) continue
+    const nextId = nextByLabel[previous.label]
+    if (nextId === undefined || seen.has(nextId)) continue
+    seen.add(nextId)
+    remapped.push(nextId)
+  }
+
+  return remapped
 }
 
 function isBinaryValue(value) {
@@ -626,8 +674,12 @@ function buildViewParams({
   viewStart,
   panelHeight,
   activeTab,
+  annotationGroups,
+  allChannels,
 }) {
-  const channelById = Object.fromEntries(edfData.channels.map((ch) => [ch.id, ch]))
+  const channelById = Object.fromEntries(
+    (allChannels ?? [...edfData.channels]).map((ch) => [ch.id, ch])
+  )
 
   const selectedChannelLabels = selectedChannels
     .map((id) => channelById[id]?.label)
@@ -647,6 +699,9 @@ function buildViewParams({
     }
   })
 
+  const uniqueLabels = getUniqueAnnotationLabels(edfData.annotations ?? [])
+  const normalizedGroups = normalizeAnnotationGroups(annotationGroups, uniqueLabels)
+
   return {
     selectedChannelLabels,
     channelDisplayOrderLabels: selectedChannelLabels,
@@ -656,6 +711,7 @@ function buildViewParams({
     channelStripHeightsByLabel: mapIdsToLabels(channelStripHeights, channelById),
     channelYZoomByLabel: mapIdsToLabels(channelYZoom, channelById),
     channelYRangeByLabel: mapIdsToLabels(channelYRange, channelById),
+    annotationGroups: serializeAnnotationGroups(normalizedGroups),
     windowSeconds,
     viewStart,
     panelHeight,
@@ -684,6 +740,7 @@ function normalizeViewParams(params) {
     channelStripHeightsByLabel: normalizeChannelLabelRecord(params.channelStripHeightsByLabel),
     channelYZoomByLabel: normalizeChannelLabelRecord(params.channelYZoomByLabel),
     channelYRangeByLabel: normalizeChannelLabelRecord(params.channelYRangeByLabel),
+    annotationGroups: serializeAnnotationGroups(params.annotationGroups ?? []),
     windowSeconds: params.windowSeconds,
     viewStart: params.viewStart,
     panelHeight: params.panelHeight ?? DEFAULT_PANEL_HEIGHT,
@@ -706,6 +763,8 @@ function resolveFullViewParams(params, edfData, totalDuration) {
     viewStart: applied.viewStart,
     panelHeight: applied.panelHeight,
     activeTab: applied.activeTab,
+    annotationGroups: applied.annotationGroups,
+    allChannels: applied.allChannels,
   })
 }
 
@@ -716,9 +775,14 @@ function areViewParamsEqual(a, b, edfData, totalDuration) {
 }
 
 function applyViewParams(params, edfData, totalDuration) {
-  const labelToId = Object.fromEntries(edfData.channels.map((ch) => [ch.label, ch.id]))
+  const { groups, allChannels } = resolveAnnotationBundle(
+    edfData,
+    params.annotationGroups,
+    totalDuration
+  )
+  const labelToId = Object.fromEntries(allChannels.map((ch) => [ch.label, ch.id]))
   const binaryChannelIds = new Set(
-    edfData.channels.filter((ch) => isBinarySignal(ch.data)).map((ch) => ch.id)
+    allChannels.filter((ch) => isBinarySignal(ch.data)).map((ch) => ch.id)
   )
 
   const orderLabels = (params.channelDisplayOrderLabels?.length
@@ -789,13 +853,13 @@ function applyViewParams(params, edfData, totalDuration) {
     totalDuration
   )
 
-  const selectedChannelsResult = selected.length > 0 ? selected : getDefaultSelection(edfData.channels)
+  const selectedChannelsResult = selected.length > 0 ? selected : getDefaultSelection(allChannels)
 
   let overviewChannelId = params.overviewChannelLabel
     ? labelToId[params.overviewChannelLabel]
     : undefined
   if (overviewChannelId === undefined) {
-    overviewChannelId = getDefaultOverviewChannelId(edfData.channels, selectedChannelsResult)
+    overviewChannelId = getDefaultOverviewChannelId(allChannels, selectedChannelsResult)
   }
 
   Object.entries(formats).forEach(([id, format]) => {
@@ -822,6 +886,8 @@ function applyViewParams(params, edfData, totalDuration) {
     viewStart: nextViewStart,
     panelHeight: Math.max(MIN_PANEL_HEIGHT, params.panelHeight ?? DEFAULT_PANEL_HEIGHT),
     activeTab: resolveActiveTab(params),
+    annotationGroups: groups,
+    allChannels,
   }
 }
 
@@ -830,6 +896,16 @@ const SignalViewer = ({ edfData, onBack }) => {
   const canvasWrapRef = useRef(null)
   const containerRef = useRef(null)
   const overviewStripRef = useRef(null)
+  const totalDuration = edfData.totalDuration
+  const uniqueAnnotationLabels = useMemo(
+    () => getUniqueAnnotationLabels(edfData.annotations ?? []),
+    [edfData.annotations]
+  )
+
+  const [annotationGroups, setAnnotationGroups] = useState(() =>
+    buildDefaultAnnotationGroups(getUniqueAnnotationLabels(edfData.annotations ?? []))
+  )
+  const [draftAnnotationGroups, setDraftAnnotationGroups] = useState(null)
   const [selectedChannels, setSelectedChannels] = useState(() =>
     getDefaultSelection(edfData.channels)
   )
@@ -865,12 +941,39 @@ const SignalViewer = ({ edfData, onBack }) => {
   const [maskSelection, setMaskSelection] = useState(null)
   const [maskHistory, setMaskHistory] = useState([])
 
-  const totalDuration = edfData.totalDuration
   const viewEnd = Math.min(viewStart + windowSeconds, totalDuration)
 
+  const annotationGroupsRef = useRef(annotationGroups)
+  const draftAnnotationGroupsRef = useRef(draftAnnotationGroups)
+
+  useEffect(() => {
+    annotationGroupsRef.current = annotationGroups
+  }, [annotationGroups])
+
+  useEffect(() => {
+    draftAnnotationGroupsRef.current = draftAnnotationGroups
+  }, [draftAnnotationGroups])
+
+  const displayAnnotationGroups = draftAnnotationGroups ?? annotationGroups
+
+  const annotationChannels = useMemo(
+    () =>
+      buildAnnotationChannels(
+        edfData.annotations ?? [],
+        totalDuration,
+        annotationGroups
+      ),
+    [edfData.annotations, totalDuration, annotationGroups]
+  )
+
+  const allChannels = useMemo(
+    () => [...edfData.channels, ...annotationChannels],
+    [edfData.channels, annotationChannels]
+  )
+
   const channelById = useMemo(
-    () => Object.fromEntries(edfData.channels.map((ch) => [ch.id, ch])),
-    [edfData.channels]
+    () => Object.fromEntries(allChannels.map((ch) => [ch.id, ch])),
+    [allChannels]
   )
 
   const channelByIdRef = useRef(channelById)
@@ -884,14 +987,37 @@ const SignalViewer = ({ edfData, onBack }) => {
     [selectedChannels, channelById]
   )
 
-  const channelsForSelectionList = useMemo(() => {
+  const physiologicalChannelsForList = useMemo(() => {
     const selectedSet = new Set(selectedChannels)
     const selectedOrdered = selectedChannels
       .map((id) => channelById[id])
-      .filter(Boolean)
+      .filter((ch) => ch && !ch.isAnnotationChannel)
     const unselected = edfData.channels.filter((ch) => !selectedSet.has(ch.id))
     return [...selectedOrdered, ...unselected]
   }, [edfData.channels, selectedChannels, channelById])
+
+  const annotationItemsForList = useMemo(() => {
+    const items = displayAnnotationGroups.map((group, groupIndex) => {
+      const committed = annotationGroups[groupIndex]
+      const channel =
+        (committed
+          ? annotationChannels.find((ch) => ch.label === committed.name)
+          : null) ??
+        annotationChannels.find((ch) => ch.label === group.name) ??
+        null
+      return { group, groupIndex, channel }
+    })
+    const selectedOrdered = selectedChannels
+      .map((id) => items.find((item) => item.channel?.id === id))
+      .filter(Boolean)
+    const selectedKeys = new Set(
+      selectedOrdered.map((item) => `${item.groupIndex}:${item.group.name}`)
+    )
+    const rest = items.filter(
+      (item) => !selectedKeys.has(`${item.groupIndex}:${item.group.name}`)
+    )
+    return [...selectedOrdered, ...rest]
+  }, [displayAnnotationGroups, annotationGroups, annotationChannels, selectedChannels])
 
   const canvasHeight = useMemo(
     () => getCanvasHeightForPanel(panelHeight),
@@ -927,9 +1053,80 @@ const SignalViewer = ({ edfData, onBack }) => {
     if (overviewChannelId !== null && channelById[overviewChannelId]) {
       return channelById[overviewChannelId]
     }
-    const fallbackId = getDefaultOverviewChannelId(edfData.channels, selectedChannels)
+    const fallbackId = getDefaultOverviewChannelId(allChannels, selectedChannels)
     return fallbackId !== null ? channelById[fallbackId] ?? null : null
-  }, [overviewChannelId, channelById, edfData.channels, selectedChannels])
+  }, [overviewChannelId, channelById, allChannels, selectedChannels])
+
+  const previousAllChannelsRef = useRef(allChannels)
+
+  useEffect(() => {
+    const previous = previousAllChannelsRef.current
+    previousAllChannelsRef.current = allChannels
+    if (previous === allChannels) return
+
+    const nextIds = new Set(allChannels.map((ch) => ch.id))
+    const labelOf = (channels, id) => channels.find((ch) => ch.id === Number(id))?.label
+    const idForLabel = (channels, label) => channels.find((ch) => ch.label === label)?.id
+
+    setSelectedChannels((prev) => {
+      if (prev.every((id) => nextIds.has(id))) return prev
+      return remapSelectedChannelIds(prev, previous, allChannels)
+    })
+
+    setChannelFormats((prev) => {
+      const entries = Object.entries(prev)
+      if (entries.every(([id]) => nextIds.has(Number(id)))) return prev
+      const next = {}
+      entries.forEach(([id, format]) => {
+        const label = labelOf(previous, id)
+        const nextId = label ? idForLabel(allChannels, label) : undefined
+        if (nextId !== undefined) next[nextId] = format
+      })
+      return next
+    })
+
+    setBinaryMaskOverlays((prev) => {
+      const entries = Object.entries(prev)
+      if (entries.every(([maskId]) => nextIds.has(Number(maskId)))) return prev
+      const next = {}
+      entries.forEach(([maskId, targets]) => {
+        const maskLabel = labelOf(previous, maskId)
+        const nextMaskId = maskLabel ? idForLabel(allChannels, maskLabel) : undefined
+        if (nextMaskId === undefined) return
+        next[nextMaskId] = (targets ?? [])
+          .map((targetId) => {
+            const targetLabel = labelOf(previous, targetId)
+            return targetLabel ? idForLabel(allChannels, targetLabel) : undefined
+          })
+          .filter((id) => id !== undefined)
+      })
+      return next
+    })
+
+    const remapIdRecord = (prev) => {
+      const entries = Object.entries(prev)
+      if (entries.every(([id]) => nextIds.has(Number(id)))) return prev
+      const next = {}
+      entries.forEach(([id, value]) => {
+        const label = labelOf(previous, id)
+        const nextId = label ? idForLabel(allChannels, label) : undefined
+        if (nextId !== undefined) next[nextId] = value
+      })
+      return next
+    }
+
+    setChannelStripHeights((prev) => remapIdRecord(prev))
+    setChannelYZoom((prev) => remapIdRecord(prev))
+    setChannelYRange((prev) => remapIdRecord(prev))
+
+    setOverviewChannelId((prev) => {
+      if (nextIds.has(prev)) return prev
+      const label = labelOf(previous, prev)
+      const nextId = label ? idForLabel(allChannels, label) : undefined
+      if (nextId !== undefined) return nextId
+      return getDefaultOverviewChannelId(allChannels, getDefaultSelection(allChannels))
+    })
+  }, [allChannels])
 
   const panelHeightRef = useRef(panelHeight)
   const channelStripHeightsRef = useRef(channelStripHeights)
@@ -1036,8 +1233,8 @@ const SignalViewer = ({ edfData, onBack }) => {
   }, [activeChannelKey, activeChannels])
 
   const binaryChannelIds = useMemo(
-    () => new Set(edfData.channels.filter((ch) => isBinarySignal(ch.data)).map((ch) => ch.id)),
-    [edfData]
+    () => new Set(allChannels.filter((ch) => isBinarySignal(ch.data)).map((ch) => ch.id)),
+    [allChannels]
   )
 
   const getChannelFormat = useCallback(
@@ -1117,6 +1314,9 @@ const SignalViewer = ({ edfData, onBack }) => {
   }, [persistMaskToDb, channelById])
 
   const updateMaskAndSave = useCallback((channelId, nextData) => {
+    if (isAnnotationChannelId(channelId) || channelByIdRef.current[channelId]?.isAnnotationChannel) {
+      return
+    }
     const snapshot = cloneMaskOverrides(maskOverridesRef.current)
     setMaskHistory((history) => [...history, snapshot].slice(-MAX_MASK_UNDO_HISTORY))
     setMaskOverrides((prev) => ({ ...prev, [channelId]: nextData }))
@@ -1159,6 +1359,8 @@ const SignalViewer = ({ edfData, onBack }) => {
 
   const applyPresetToViewer = useCallback((preset, message) => {
     const next = applyViewParams(preset.params, edfData, totalDuration)
+    setDraftAnnotationGroups(null)
+    setAnnotationGroups(next.annotationGroups)
     setSelectedChannels(next.selectedChannels)
     setChannelFormats(next.channelFormats)
     setBinaryMaskOverlays(next.binaryMaskOverlays)
@@ -1214,6 +1416,8 @@ const SignalViewer = ({ edfData, onBack }) => {
         viewStart,
         panelHeight,
         activeTab,
+        annotationGroups,
+        allChannels,
       }),
     [
       edfData,
@@ -1228,6 +1432,8 @@ const SignalViewer = ({ edfData, onBack }) => {
       viewStart,
       panelHeight,
       activeTab,
+      annotationGroups,
+      allChannels,
     ]
   )
 
@@ -1255,6 +1461,7 @@ const SignalViewer = ({ edfData, onBack }) => {
     viewStart,
     panelHeight,
     activeTab,
+    annotationGroups,
   ])
 
   const getChannelPlotWidth = useCallback(
@@ -1335,7 +1542,12 @@ const SignalViewer = ({ edfData, onBack }) => {
     setPresetMessage('')
 
     try {
-      const id = await saveViewPreset(presetName, getCurrentViewParams())
+      const committedGroups = commitAnnotationDraft()
+      const params = {
+        ...getCurrentViewParams(),
+        annotationGroups: serializeAnnotationGroups(committedGroups),
+      }
+      const id = await saveViewPreset(presetName, params)
       await refreshPresets()
       setLoadedPresetId(id)
       setPresetMessage(`Saved view format "${presetName.trim()}"`)
@@ -1356,7 +1568,12 @@ const SignalViewer = ({ edfData, onBack }) => {
     setPresetMessage('')
 
     try {
-      await updateViewPresetById(loadedPreset.id, getCurrentViewParams())
+      const committedGroups = commitAnnotationDraft()
+      const params = {
+        ...getCurrentViewParams(),
+        annotationGroups: serializeAnnotationGroups(committedGroups),
+      }
+      await updateViewPresetById(loadedPreset.id, params)
       await refreshPresets()
       setPresetMessage(`Updated view format "${loadedPreset.name}"`)
     } catch (error) {
@@ -1811,6 +2028,373 @@ const SignalViewer = ({ edfData, onBack }) => {
     })
   }
 
+  const cloneAnnotationGroups = useCallback((groups) => (
+    (groups ?? []).map((group) => ({
+      name: group.name,
+      labels: { ...(group.labels ?? {}) },
+    }))
+  ), [])
+
+  const commitAnnotationGroups = useCallback((nextGroups) => {
+    const normalized = normalizeAnnotationGroups(nextGroups, uniqueAnnotationLabels)
+    draftAnnotationGroupsRef.current = null
+    annotationGroupsRef.current = normalized
+    setDraftAnnotationGroups(null)
+    setAnnotationGroups(normalized)
+    return normalized
+  }, [uniqueAnnotationLabels])
+
+  const commitAnnotationDraft = useCallback(() => {
+    const draft = draftAnnotationGroupsRef.current
+    if (!draft) return annotationGroupsRef.current
+    return commitAnnotationGroups(draft)
+  }, [commitAnnotationGroups])
+
+  const updateAnnotationDraft = useCallback((updater) => {
+    setDraftAnnotationGroups((prev) => {
+      const base = prev ?? cloneAnnotationGroups(annotationGroupsRef.current)
+      const next = typeof updater === 'function' ? updater(base) : updater
+      draftAnnotationGroupsRef.current = next
+      return next
+    })
+  }, [cloneAnnotationGroups])
+
+  const handleAnnotationSectionBlur = useCallback((event) => {
+    const next = event.relatedTarget
+    if (next && event.currentTarget.contains(next)) return
+    commitAnnotationDraft()
+  }, [commitAnnotationDraft])
+
+  const handleResetAnnotationGroups = useCallback(() => {
+    commitAnnotationGroups(buildDefaultAnnotationGroups(uniqueAnnotationLabels))
+  }, [commitAnnotationGroups, uniqueAnnotationLabels])
+
+  const handleAnnotationGroupRename = useCallback((groupIndex, nextName) => {
+    updateAnnotationDraft((prev) =>
+      prev.map((group, index) =>
+        index === groupIndex ? { ...group, name: nextName } : group
+      )
+    )
+  }, [updateAnnotationDraft])
+
+  const handleAnnotationLabelValueChange = useCallback((groupIndex, label, nextValue) => {
+    const value = Math.max(1, Math.round(Number(nextValue)) || 1)
+    updateAnnotationDraft((prev) =>
+      prev.map((group, index) => {
+        if (index !== groupIndex) return group
+        if (!(label in group.labels)) return group
+        return {
+          ...group,
+          labels: { ...group.labels, [label]: value },
+        }
+      })
+    )
+  }, [updateAnnotationDraft])
+
+  const handleToggleAnnotationLabel = useCallback((groupIndex, label, included) => {
+    updateAnnotationDraft((prev) =>
+      prev.map((group, index) => {
+        const labels = { ...group.labels }
+
+        if (index === groupIndex) {
+          if (included) {
+            if (!(label in labels)) {
+              const maxValue = Math.max(0, ...Object.values(labels).map(Number))
+              labels[label] = maxValue + 1
+            }
+          } else {
+            delete labels[label]
+          }
+          return { ...group, labels }
+        }
+
+        if (included && label in labels) {
+          delete labels[label]
+          return { ...group, labels }
+        }
+
+        return group
+      })
+    )
+  }, [updateAnnotationDraft])
+
+  const handleAddAnnotationChannel = useCallback(() => {
+    const base = draftAnnotationGroupsRef.current ?? annotationGroupsRef.current
+    const used = new Set(base.map((group) => group.name))
+    let name = 'CHANNEL'
+    let suffix = 1
+    while (used.has(name)) {
+      suffix += 1
+      name = `CHANNEL_${suffix}`
+    }
+    commitAnnotationGroups([...base, { name, labels: {} }])
+  }, [commitAnnotationGroups])
+
+  const handleRemoveAnnotationChannel = useCallback((groupIndex) => {
+    const base = draftAnnotationGroupsRef.current ?? annotationGroupsRef.current
+    if (base.length <= 1) {
+      commitAnnotationGroups(buildDefaultAnnotationGroups(uniqueAnnotationLabels))
+      return
+    }
+    commitAnnotationGroups(base.filter((_, index) => index !== groupIndex))
+  }, [commitAnnotationGroups, uniqueAnnotationLabels])
+
+  // Commit pending annotation edits when leaving Channel Select.
+  useEffect(() => {
+    if (activeTab === VIEWER_TABS.CHANNELS) return undefined
+    commitAnnotationDraft()
+    return undefined
+  }, [activeTab, commitAnnotationDraft])
+  const renderChannelSelectItem = (channel) => {
+    const isBinary = binaryChannelIds.has(channel.id)
+    const format = getChannelFormat(channel.id)
+    const maskColorIndex = binaryMaskChannels.findIndex(
+      (maskChannel) => maskChannel.id === channel.id
+    )
+    const maskColor = maskColorIndex >= 0 ? getBinaryMaskColor(maskColorIndex) : null
+    const overlayTargets = getBinaryMaskOverlayTargets(channel.id)
+
+    return (
+      <div key={channel.id} className="channel-item">
+        <label className="channel-item-header">
+          <input
+            type="checkbox"
+            checked={selectedChannels.includes(channel.id)}
+            onChange={() => handleChannelToggle(channel.id)}
+          />
+          <span className="channel-label">{channel.label}</span>
+          {maskColor ? (
+            <span
+              className="binary-mask-color-swatch"
+              style={{ backgroundColor: maskColor.stroke }}
+              title="Binary mask color"
+            />
+          ) : null}
+        </label>
+        <span className="channel-meta">
+          {channel.sampleRate.toFixed(1)} Hz
+          {channel.physicalDimension ? ` · ${channel.physicalDimension}` : ''}
+          {isBinary ? ' · binary' : ''}
+        </span>
+        <select
+          className="channel-depiction-select"
+          value={format}
+          onChange={(e) => handleFormatChange(channel.id, e.target.value)}
+          onClick={(e) => e.stopPropagation()}
+          title={isBinary ? 'Choose depiction format' : 'Binary mask requires 0/1 signal values'}
+        >
+          {DEPICTION_OPTIONS.map((option) => (
+            <option
+              key={option.value}
+              value={option.value}
+              disabled={
+                option.value === DEPICTION_FORMATS.BINARY_MASK && !isBinary
+              }
+            >
+              {option.label}
+              {option.value === DEPICTION_FORMATS.BINARY_MASK && !isBinary
+                ? ' (0/1 only)'
+                : ''}
+            </option>
+          ))}
+        </select>
+        {format === DEPICTION_FORMATS.BINARY_MASK ? (
+          <div className="binary-mask-overlay-targets">
+            <span className="binary-mask-overlay-label">Overlay on:</span>
+            {overlayCandidateChannels.length === 0 ? (
+              <span className="binary-mask-overlay-empty">
+                Select sequence channels to overlay this mask.
+              </span>
+            ) : (
+              overlayCandidateChannels.map((targetChannel) => (
+                <label
+                  key={targetChannel.id}
+                  className="binary-mask-overlay-option"
+                >
+                  <input
+                    type="checkbox"
+                    checked={overlayTargets.includes(targetChannel.id)}
+                    onChange={(e) =>
+                      handleBinaryMaskOverlayToggle(
+                        channel.id,
+                        targetChannel.id,
+                        e.target.checked
+                      )
+                    }
+                  />
+                  <span>{targetChannel.label}</span>
+                </label>
+              ))
+            )}
+          </div>
+        ) : null}
+      </div>
+    )
+  }
+
+  const renderAnnotationChannelItem = (group, groupIndex, channel) => {
+    const includedLabels = Object.entries(group.labels ?? {})
+    const canSelect = Boolean(channel)
+    const isBinary = channel ? binaryChannelIds.has(channel.id) : false
+    const format = channel
+      ? getChannelFormat(channel.id)
+      : DEPICTION_FORMATS.SEQUENCE
+    const maskColorIndex = channel
+      ? binaryMaskChannels.findIndex((maskChannel) => maskChannel.id === channel.id)
+      : -1
+    const maskColor = maskColorIndex >= 0 ? getBinaryMaskColor(maskColorIndex) : null
+    const overlayTargets = channel ? getBinaryMaskOverlayTargets(channel.id) : []
+    const groupCount = displayAnnotationGroups.length
+
+    return (
+      <div
+        key={`ann-item-${groupIndex}`}
+        className={`channel-item channel-item--annotation${
+          draftAnnotationGroups ? ' channel-item--annotation-editing' : ''
+        }`}
+      >
+        <div className="channel-item-header">
+          {canSelect ? (
+            <input
+              type="checkbox"
+              checked={selectedChannels.includes(channel.id)}
+              onChange={() => handleChannelToggle(channel.id)}
+              aria-label={`Select ${group.name}`}
+            />
+          ) : (
+            <input type="checkbox" disabled checked={false} aria-label="Select channel" />
+          )}
+          <label className="annotation-group-name channel-item-channel-label">
+            <span className="visually-hidden">channel-label</span>
+            <input
+              type="text"
+              className="channel-label-input"
+              value={group.name}
+              onChange={(e) => handleAnnotationGroupRename(groupIndex, e.target.value)}
+              placeholder="channel-label"
+              onClick={(e) => e.stopPropagation()}
+            />
+          </label>
+          {maskColor ? (
+            <span
+              className="binary-mask-color-swatch"
+              style={{ backgroundColor: maskColor.stroke }}
+              title="Binary mask color"
+            />
+          ) : null}
+          <button
+            type="button"
+            className="btn btn-small btn-secondary channel-item-remove"
+            onClick={() => handleRemoveAnnotationChannel(groupIndex)}
+            disabled={groupCount <= 1}
+            title="Remove this channel-label"
+          >
+            Remove
+          </button>
+        </div>
+        <span className="channel-meta">
+          {canSelect ? `${channel.sampleRate.toFixed(1)} Hz · annotation` : 'annotation · no labels yet'}
+          {isBinary ? ' · binary' : ''}
+          {includedLabels.length > 0
+            ? ` · ${includedLabels.map(([label, value]) => `${label}=${value}`).join(', ')}`
+            : ''}
+          {draftAnnotationGroups ? ' · editing…' : ''}
+        </span>
+        {canSelect ? (
+          <select
+            className="channel-depiction-select"
+            value={format}
+            onChange={(e) => handleFormatChange(channel.id, e.target.value)}
+            onClick={(e) => e.stopPropagation()}
+            title={isBinary ? 'Choose depiction format' : 'Binary mask requires 0/1 signal values'}
+          >
+            {DEPICTION_OPTIONS.map((option) => (
+              <option
+                key={option.value}
+                value={option.value}
+                disabled={
+                  option.value === DEPICTION_FORMATS.BINARY_MASK && !isBinary
+                }
+              >
+                {option.label}
+                {option.value === DEPICTION_FORMATS.BINARY_MASK && !isBinary
+                  ? ' (0/1 only)'
+                  : ''}
+              </option>
+            ))}
+          </select>
+        ) : null}
+        {canSelect && format === DEPICTION_FORMATS.BINARY_MASK ? (
+          <div className="binary-mask-overlay-targets">
+            <span className="binary-mask-overlay-label">Overlay on:</span>
+            {overlayCandidateChannels.length === 0 ? (
+              <span className="binary-mask-overlay-empty">
+                Select sequence channels to overlay this mask.
+              </span>
+            ) : (
+              overlayCandidateChannels.map((targetChannel) => (
+                <label
+                  key={targetChannel.id}
+                  className="binary-mask-overlay-option"
+                >
+                  <input
+                    type="checkbox"
+                    checked={overlayTargets.includes(targetChannel.id)}
+                    onChange={(e) =>
+                      handleBinaryMaskOverlayToggle(
+                        channel.id,
+                        targetChannel.id,
+                        e.target.checked
+                      )
+                    }
+                  />
+                  <span>{targetChannel.label}</span>
+                </label>
+              ))
+            )}
+          </div>
+        ) : null}
+        <div className="annotation-group-label-picker">
+          <span className="annotation-group-picker-title">Include labels</span>
+          {uniqueAnnotationLabels.map((label) => {
+            const included = Object.prototype.hasOwnProperty.call(group.labels, label)
+            const value = included ? group.labels[label] : 1
+            return (
+              <label
+                key={label}
+                className={`annotation-group-pick-row${
+                  included ? ' annotation-group-pick-row--active' : ''
+                }`}
+              >
+                <input
+                  type="checkbox"
+                  checked={included}
+                  onChange={(e) =>
+                    handleToggleAnnotationLabel(groupIndex, label, e.target.checked)
+                  }
+                />
+                <span className="annotation-group-pick-label">{label}</span>
+                <span className="annotation-group-value">
+                  <span>value</span>
+                  <input
+                    type="number"
+                    min={1}
+                    step={1}
+                    value={value}
+                    disabled={!included}
+                    onChange={(e) =>
+                      handleAnnotationLabelValueChange(groupIndex, label, e.target.value)
+                    }
+                  />
+                </span>
+              </label>
+            )
+          })}
+        </div>
+      </div>
+    )
+  }
+
   const onMaskEditMoveRef = useRef(() => {})
   const completeMaskEditDragRef = useRef(() => {})
 
@@ -1860,7 +2444,7 @@ const SignalViewer = ({ edfData, onBack }) => {
 
     const canvas = canvasRef.current
     const channel = channelById[channelId]
-    if (!canvas || !channel) return
+    if (!canvas || !channel || channel.isAnnotationChannel) return
 
     const data = maskOverridesRef.current[channelId] ?? channel.data
     const { viewStart: vs, viewEnd: ve } = viewRangeRef.current
@@ -2340,8 +2924,14 @@ const SignalViewer = ({ edfData, onBack }) => {
         <div>
           <h2>Signal Viewer</h2>
           <p className="viewer-meta">
-            {edfData.fileName} · {edfData.channels.length} channels · {formatDuration(totalDuration)}
+            {edfData.fileName} · {edfData.channels.length} channels
+            {annotationChannels.length > 0 ? ` · ${annotationChannels.length} annotation` : ''}
+            {' · '}
+            {formatDuration(totalDuration)}
             {edfData.isEdfPlus ? ' · EDF+' : ''}
+            {(edfData.annotations?.length ?? 0) > 0
+              ? ` · ${edfData.annotations.length} events`
+              : ''}
           </p>
         </div>
         <div className="controls">
@@ -2524,6 +3114,7 @@ const SignalViewer = ({ edfData, onBack }) => {
                     })}
                     {channelStripLayouts.map(({ channel, topPercent, heightPercent }) => {
                       if (getChannelFormat(channel.id) !== DEPICTION_FORMATS.BINARY_MASK) return null
+                      if (channel.isAnnotationChannel) return null
 
                       return (
                         <div
@@ -2741,100 +3332,93 @@ const SignalViewer = ({ edfData, onBack }) => {
                   value={overviewChannelId ?? ''}
                   onChange={(e) => setOverviewChannelId(Number(e.target.value))}
                 >
-                  {edfData.channels.map((channel) => (
+                  {allChannels.map((channel) => (
                     <option key={channel.id} value={channel.id}>
                       {channel.label}
+                      {channel.isAnnotationChannel ? ' (annotation)' : ''}
                     </option>
                   ))}
                 </select>
               </div>
-              <div className="channel-list">
-                {channelsForSelectionList.map((channel) => {
-                  const isBinary = binaryChannelIds.has(channel.id)
-                  const format = getChannelFormat(channel.id)
-                  const maskColorIndex = binaryMaskChannels.findIndex(
-                    (maskChannel) => maskChannel.id === channel.id
-                  )
-                  const maskColor = maskColorIndex >= 0 ? getBinaryMaskColor(maskColorIndex) : null
-                  const overlayTargets = getBinaryMaskOverlayTargets(channel.id)
 
-                  return (
-                    <div key={channel.id} className="channel-item">
-                      <label className="channel-item-header">
-                        <input
-                          type="checkbox"
-                          checked={selectedChannels.includes(channel.id)}
-                          onChange={() => handleChannelToggle(channel.id)}
-                        />
-                        <span className="channel-label">{channel.label}</span>
-                        {maskColor ? (
-                          <span
-                            className="binary-mask-color-swatch"
-                            style={{ backgroundColor: maskColor.stroke }}
-                            title="Binary mask color"
-                          />
-                        ) : null}
-                      </label>
-                      <span className="channel-meta">
-                        {channel.sampleRate.toFixed(1)} Hz
-                        {channel.physicalDimension ? ` · ${channel.physicalDimension}` : ''}
-                        {isBinary ? ' · binary' : ''}
-                      </span>
-                      <select
-                        className="channel-depiction-select"
-                        value={format}
-                        onChange={(e) => handleFormatChange(channel.id, e.target.value)}
-                        onClick={(e) => e.stopPropagation()}
-                        title={isBinary ? 'Choose depiction format' : 'Binary mask requires 0/1 signal values'}
+              <div className="channel-section">
+                <h4 className="channel-section-title">Physiological channels</h4>
+                <div className="channel-list">
+                  {physiologicalChannelsForList.length === 0 ? (
+                    <p className="channel-section-empty">No physiological channels</p>
+                  ) : (
+                    physiologicalChannelsForList.map((channel) => renderChannelSelectItem(channel))
+                  )}
+                </div>
+              </div>
+
+              <div className="channel-section">
+                <div className="channel-section-header">
+                  <h4 className="channel-section-title">Annotation channels</h4>
+                  {uniqueAnnotationLabels.length > 0 ? (
+                    <div className="channel-section-actions">
+                      <button
+                        type="button"
+                        className="btn btn-small btn-secondary"
+                        onClick={handleAddAnnotationChannel}
                       >
-                        {DEPICTION_OPTIONS.map((option) => (
-                          <option
-                            key={option.value}
-                            value={option.value}
-                            disabled={
-                              option.value === DEPICTION_FORMATS.BINARY_MASK && !isBinary
-                            }
+                        Add channel-label
+                      </button>
+                      <button
+                        type="button"
+                        className="btn btn-small btn-secondary"
+                        onClick={handleResetAnnotationGroups}
+                      >
+                        Reset to one label / channel
+                      </button>
+                    </div>
+                  ) : null}
+                </div>
+                {uniqueAnnotationLabels.length === 0 ? (
+                  <p className="channel-section-empty">
+                    No EDF+ annotations found in this file.
+                  </p>
+                ) : (
+                  <>
+                    <p className="annotation-group-editor-hint">
+                      Hover a channel to pick labels and values. Edits stay in draft until you
+                      leave this section or click Apply (avoids rebuilding on every change).
+                      Single-label channels can use Binary mask.
+                    </p>
+                    <div
+                      className="annotation-draft-section"
+                      onMouseLeave={commitAnnotationDraft}
+                      onBlur={handleAnnotationSectionBlur}
+                    >
+                      <div className="channel-list channel-list--annotation">
+                        {annotationItemsForList.map(({ group, groupIndex, channel }) =>
+                          renderAnnotationChannelItem(group, groupIndex, channel)
+                        )}
+                      </div>
+                      {draftAnnotationGroups ? (
+                        <div className="annotation-draft-actions">
+                          <button
+                            type="button"
+                            className="btn btn-small btn-primary"
+                            onClick={commitAnnotationDraft}
                           >
-                            {option.label}
-                            {option.value === DEPICTION_FORMATS.BINARY_MASK && !isBinary
-                              ? ' (0/1 only)'
-                              : ''}
-                          </option>
-                        ))}
-                      </select>
-                      {format === DEPICTION_FORMATS.BINARY_MASK ? (
-                        <div className="binary-mask-overlay-targets">
-                          <span className="binary-mask-overlay-label">Overlay on:</span>
-                          {overlayCandidateChannels.length === 0 ? (
-                            <span className="binary-mask-overlay-empty">
-                              Select sequence channels to overlay this mask.
-                            </span>
-                          ) : (
-                            overlayCandidateChannels.map((targetChannel) => (
-                              <label
-                                key={targetChannel.id}
-                                className="binary-mask-overlay-option"
-                              >
-                                <input
-                                  type="checkbox"
-                                  checked={overlayTargets.includes(targetChannel.id)}
-                                  onChange={(e) =>
-                                    handleBinaryMaskOverlayToggle(
-                                      channel.id,
-                                      targetChannel.id,
-                                      e.target.checked
-                                    )
-                                  }
-                                />
-                                <span>{targetChannel.label}</span>
-                              </label>
-                            ))
-                          )}
+                            Apply annotation changes
+                          </button>
+                          <button
+                            type="button"
+                            className="btn btn-small btn-secondary"
+                            onClick={() => {
+                              draftAnnotationGroupsRef.current = null
+                              setDraftAnnotationGroups(null)
+                            }}
+                          >
+                            Discard
+                          </button>
                         </div>
                       ) : null}
                     </div>
-                  )
-                })}
+                  </>
+                )}
               </div>
             </div>
           </div>
@@ -2854,7 +3438,7 @@ const SignalViewer = ({ edfData, onBack }) => {
       <ExportDataDialog
         isOpen={isExportDialogOpen}
         onClose={() => setIsExportDialogOpen(false)}
-        channels={edfData.channels}
+        channels={allChannels}
         edfData={edfData}
         getChannelData={getMaskData}
         hasPendingChanges={hasPendingExportChanges}

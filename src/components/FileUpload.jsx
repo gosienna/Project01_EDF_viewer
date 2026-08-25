@@ -2,8 +2,10 @@ import React, { useRef, useEffect, useState, useCallback } from 'react'
 import { buildEdfSummary, deleteEdfRecord, findEdfRecordsByFileName, listEdfRecords, saveEdfRecord } from '../utils/edfStorage'
 import { parseEdfFile } from '../utils/edfParser'
 
-const TEST_EDF_FILE_NAME = 'test.edf'
-const TEST_EDF_URL = `${import.meta.env.BASE_URL}${TEST_EDF_FILE_NAME}`
+const TEST_EDF_FILES = [
+  { fileName: 'test.edf', label: 'Load Test EDF' },
+  { fileName: 'test2.edf', label: 'Load Test2 EDF (annotations)' },
+]
 
 function formatDuration(seconds) {
   const hours = Math.floor(seconds / 3600)
@@ -70,18 +72,18 @@ const FileUpload = ({ onFileUpload, onLoadSavedEdf, isLoading, error }) => {
     event.preventDefault()
   }
 
-  const handleLoadTestFile = async () => {
+  const handleLoadTestFile = async (fileName) => {
     setSavedError('')
     setSavedMessage('')
 
     try {
-      const existingRecords = await findEdfRecordsByFileName(TEST_EDF_FILE_NAME)
+      const existingRecords = await findEdfRecordsByFileName(fileName)
       if (existingRecords.length > 0) {
         await onLoadSavedEdf(existingRecords[0].id)
         return
       }
 
-      const response = await fetch(TEST_EDF_URL)
+      const response = await fetch(`${import.meta.env.BASE_URL}${fileName}`)
       if (!response.ok) {
         throw new Error(`Test EDF not found (${response.status})`)
       }
@@ -89,7 +91,7 @@ const FileUpload = ({ onFileUpload, onLoadSavedEdf, isLoading, error }) => {
       const buffer = await response.arrayBuffer()
       const parsed = await parseEdfFile(buffer)
       const summary = buildEdfSummary(parsed)
-      const recordId = await saveEdfRecord(TEST_EDF_FILE_NAME, buffer, summary)
+      const recordId = await saveEdfRecord(fileName, buffer, summary)
       await refreshSavedRecords()
       await onLoadSavedEdf(recordId)
     } catch (loadError) {
@@ -145,14 +147,17 @@ const FileUpload = ({ onFileUpload, onLoadSavedEdf, isLoading, error }) => {
         </div>
 
         <div className="upload-actions">
-          <button
-            className="btn btn-secondary test-load-btn"
-            onClick={handleLoadTestFile}
-            disabled={isLoading}
-            type="button"
-          >
-            Load Test EDF
-          </button>
+          {TEST_EDF_FILES.map((testFile) => (
+            <button
+              key={testFile.fileName}
+              className="btn btn-secondary test-load-btn"
+              onClick={() => handleLoadTestFile(testFile.fileName)}
+              disabled={isLoading}
+              type="button"
+            >
+              {testFile.label}
+            </button>
+          ))}
         </div>
 
         {error ? <p className="upload-error">{error}</p> : null}

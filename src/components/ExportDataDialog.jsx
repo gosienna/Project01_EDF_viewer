@@ -73,6 +73,7 @@ function ExportDataDialog({
         channelIds: selectedChannelIds,
         getChannelData,
         fileName: edfData.fileName,
+        extraChannels: channels.filter((ch) => ch.isAnnotationChannel),
       })
       onClose()
     } catch (exportError) {
@@ -156,6 +157,7 @@ function ExportDataDialog({
                   <span className="export-channel-meta">
                     {channel.sampleRate.toFixed(1)} Hz
                     {channel.physicalDimension ? ` · ${channel.physicalDimension}` : ''}
+                    {channel.isAnnotationChannel ? ' · annotation' : ''}
                   </span>
                 </label>
               ))}

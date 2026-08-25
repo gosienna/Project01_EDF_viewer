@@ -21,7 +21,9 @@ export function physicalToDigital(physical, channel) {
 
 export function buildEdfBuffer(edfData, channelIds, getChannelData) {
   const channelById = Object.fromEntries(edfData.channels.map((ch) => [ch.id, ch]))
-  const channels = channelIds.map((id) => channelById[id]).filter(Boolean)
+  const channels = channelIds
+    .map((id) => channelById[id])
+    .filter((channel) => channel && !channel.isAnnotationChannel)
 
   if (channels.length === 0) {
     throw new Error('No channels selected for export')

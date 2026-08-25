@@ -17,6 +17,78 @@ function digitalToPhysical(digital, channel) {
   return ((digital - channel.digitalMin) / digRange) * physRange + channel.physicalMin
 }
 
+const TAL_SEP = 0x14
+const TAL_DURATION_CHAR = String.fromCharCode(0x15)
+const latin1Decoder = new TextDecoder('latin1')
+
+export function isAnnotationSignalLabel(label) {
+  const normalized = String(label ?? '').trim()
+  return normalized === 'EDF Annotations' || normalized === 'BDF Annotations'
+}
+
+function isEdfPlusReserved(reserved) {
+  const value = String(reserved ?? '').trim()
+  return value.startsWith('EDF+') || value.startsWith('BDF+')
+}
+
+function decodeLatin1(blob, start, end) {
+  return latin1Decoder.decode(blob.subarray(start, end))
+}
+
+/**
+ * Parse Time-stamped Annotation Lists (TAL) from an annotation-channel byte slot.
+ * @returns {{ onset: number, duration: number, label: string }[]}
+ */
+export function parseTalBytes(blob) {
+  const events = []
+  let i = 0
+
+  while (i < blob.length) {
+    while (i < blob.length && blob[i] === 0) i += 1
+    if (i >= blob.length) break
+
+    if (blob[i] !== 0x2b && blob[i] !== 0x2d) {
+      i += 1
+      continue
+    }
+
+    const onsetStart = i
+    i += 1
+    while (i < blob.length && blob[i] !== TAL_SEP && blob[i] !== 0) {
+      i += 1
+    }
+
+    const onsetField = decodeLatin1(blob, onsetStart, i)
+    let onset = 0
+    let duration = 0
+    const durationIdx = onsetField.indexOf(TAL_DURATION_CHAR)
+    if (durationIdx >= 0) {
+      onset = parseFloat(onsetField.slice(0, durationIdx)) || 0
+      duration = parseFloat(onsetField.slice(durationIdx + 1)) || 0
+    } else {
+      onset = parseFloat(onsetField) || 0
+    }
+
+    const labels = []
+    while (i < blob.length && blob[i] === TAL_SEP) {
+      i += 1
+      const textStart = i
+      while (i < blob.length && blob[i] !== TAL_SEP && blob[i] !== 0) {
+        i += 1
+      }
+      const text = decodeLatin1(blob, textStart, i)
+      if (text === '') break
+      labels.push(text)
+    }
+
+    for (const label of labels) {
+      events.push({ onset, duration, label })
+    }
+  }
+
+  return events
+}
+
 export async function parseEdfFile(source) {
   const buffer = source instanceof ArrayBuffer
     ? source
@@ -56,7 +128,7 @@ export async function parseEdfFile(source) {
   const prefilterings = readFieldBlock(136, 80)
   const samplesPerRecord = readFieldBlock(216, 8).map((v) => parseInt(v, 10) || 0)
 
-  const channels = labels.map((label, index) => ({
+  const allSignals = labels.map((label, index) => ({
     id: index,
     label,
     transducer: transducers[index],
@@ -68,10 +140,11 @@ export async function parseEdfFile(source) {
     prefiltering: prefilterings[index],
     samplesPerRecord: samplesPerRecord[index],
     sampleRate: header.duration > 0 ? samplesPerRecord[index] / header.duration : 0,
+    isAnnotationSignal: isAnnotationSignalLabel(label),
     data: [],
   }))
 
-  const expectedDataBytes = channels.reduce(
+  const expectedDataBytes = allSignals.reduce(
     (sum, channel) => sum + header.numRecords * channel.samplesPerRecord * 2,
     0
   )
@@ -82,22 +155,43 @@ export async function parseEdfFile(source) {
     )
   }
 
+  const annotations = []
   let offset = header.headerBytes
+
   for (let record = 0; record < header.numRecords; record += 1) {
     for (let channelIndex = 0; channelIndex < numSignals; channelIndex += 1) {
-      const channel = channels[channelIndex]
-      for (let sample = 0; sample < channel.samplesPerRecord; sample += 1) {
-        const digital = view.getInt16(offset, true)
-        offset += 2
-        channel.data.push(digitalToPhysical(digital, channel))
+      const signal = allSignals[channelIndex]
+      const byteLength = signal.samplesPerRecord * 2
+
+      if (signal.isAnnotationSignal) {
+        const blob = bytes.subarray(offset, offset + byteLength)
+        annotations.push(...parseTalBytes(blob))
+        offset += byteLength
+      } else {
+        for (let sample = 0; sample < signal.samplesPerRecord; sample += 1) {
+          const digital = view.getInt16(offset, true)
+          offset += 2
+          signal.data.push(digitalToPhysical(digital, signal))
+        }
       }
     }
   }
+
+  annotations.sort((a, b) => a.onset - b.onset || a.duration - b.duration)
+
+  const channels = allSignals
+    .filter((signal) => !signal.isAnnotationSignal)
+    .map((signal, index) => ({
+      ...signal,
+      id: index,
+      isAnnotationSignal: undefined,
+    }))
 
   return {
     header,
     totalDuration: header.numRecords * header.duration,
     channels,
-    isEdfPlus: header.reserved.startsWith('EDF'),
+    annotations,
+    isEdfPlus: isEdfPlusReserved(header.reserved),
   }
 }
