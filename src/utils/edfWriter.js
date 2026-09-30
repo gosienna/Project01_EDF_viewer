@@ -19,11 +19,21 @@ export function physicalToDigital(physical, channel) {
   return Math.max(channel.digitalMin, Math.min(channel.digitalMax, digital))
 }
 
-export function buildEdfBuffer(edfData, channelIds, getChannelData) {
-  const channelById = Object.fromEntries(edfData.channels.map((ch) => [ch.id, ch]))
+export function buildEdfBuffer(edfData, channelIds, getChannelData, extraChannels = []) {
+  const channelById = Object.fromEntries(
+    [...edfData.channels, ...extraChannels].map((channel) => [channel.id, channel])
+  )
+  const recordDuration = edfData.header.duration > 0 ? edfData.header.duration : 1
   const channels = channelIds
     .map((id) => channelById[id])
     .filter((channel) => channel && !channel.isAnnotationChannel)
+    .map((channel) => {
+      if (!channel.isImported) return channel
+      return {
+        ...channel,
+        samplesPerRecord: Math.max(1, Math.round(channel.sampleRate * recordDuration)),
+      }
+    })
 
   if (channels.length === 0) {
     throw new Error('No channels selected for export')

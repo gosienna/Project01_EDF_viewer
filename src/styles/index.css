@@ -254,6 +254,101 @@ body {
   max-height: none;
 }
 
+.parquet-import-panel {
+  margin-bottom: 0;
+  padding: 1rem;
+  background: #f7fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+}
+
+.parquet-import-header {
+  margin-bottom: 0.75rem;
+}
+
+.parquet-import-header h3 {
+  color: #2d3748;
+  margin-bottom: 0.25rem;
+}
+
+.parquet-import-hint,
+.parquet-import-empty,
+.parquet-import-meta {
+  color: #718096;
+  font-size: 0.8rem;
+  margin: 0;
+}
+
+.parquet-import-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 0.75rem;
+  margin-bottom: 0.75rem;
+}
+
+.parquet-import-rate {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  color: #4a5568;
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+
+.parquet-import-rate-input {
+  width: 10rem;
+  padding: 0.45rem 0.6rem;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  font-size: 0.9rem;
+  font-weight: 500;
+  color: #2d3748;
+  background: white;
+}
+
+.parquet-import-file input {
+  display: none;
+}
+
+.parquet-import-error {
+  color: #c53030;
+  font-size: 0.85rem;
+  margin: 0 0 0.75rem;
+}
+
+.parquet-import-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.parquet-import-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.75rem 1rem;
+  background: white;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+}
+
+.parquet-import-info {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  min-width: 0;
+}
+
+.parquet-import-name {
+  color: #2d3748;
+  font-weight: 600;
+}
+
 .viewer-header {
   display: flex;
   justify-content: space-between;
@@ -1007,12 +1102,13 @@ body {
   margin-bottom: 1rem;
   border: none;
   border-bottom: 1px solid #e2e8f0;
-  overflow: hidden;
+  overflow: visible;
   flex: 0 0 auto;
   width: 100%;
   min-height: 200px;
   display: flex;
   flex-direction: column;
+  position: relative;
 }
 
 .signal-canvas-scroll-area {
@@ -1308,6 +1404,45 @@ body.signal-viewer-mask-editing {
 
 .panel-resize-handle:hover {
   background: #e2e8f0;
+}
+
+.panel-fill-cursor {
+  position: absolute;
+  left: 50%;
+  top: 0;
+  z-index: 4;
+  width: 22px;
+  height: 30px;
+  padding: 0;
+  border: 1px solid #a0aec0;
+  border-radius: 11px;
+  background: white;
+  color: #4a5568;
+  box-shadow: 0 1px 4px rgba(45, 55, 72, 0.18);
+  transform: translate(-50%, -50%);
+  cursor: ns-resize;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.panel-fill-cursor:hover,
+.panel-fill-cursor-active {
+  color: #667eea;
+  border-color: #667eea;
+  background: #f7f9ff;
+}
+
+.panel-fill-cursor-icon {
+  width: 10px;
+  height: 16px;
+  fill: currentColor;
+}
+
+body.signal-viewer-channels-only .header,
+body.signal-viewer-channels-only .viewer-header,
+body.signal-viewer-channels-only .viewer-tabs {
+  display: none;
 }
 
 body.signal-viewer-dragging {

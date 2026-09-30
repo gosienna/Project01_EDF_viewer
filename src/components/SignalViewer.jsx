@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react'
+import React, { useState, useRef, useEffect, useCallback, useMemo, useLayoutEffect } from 'react'
 import {
   ANNOTATION_CHANNEL_ID_BASE,
   buildAnnotationChannels,
@@ -11,6 +11,14 @@ import { deleteViewPreset, listViewPresets, saveViewPreset, updateViewPresetById
 import { deleteBinaryMaskEdit, getBinaryMaskEdits, saveBinaryMaskEdit } from '../utils/binaryMaskStorage'
 import { buildEdfSummary, deleteEdfRecord, findEdfRecordsByFileName, saveEdfRecord, updateEdfRecord } from '../utils/edfStorage'
 import { buildEdfBuffer } from '../utils/edfWriter'
+import {
+  PARQUET_CHANNEL_ID_BASE,
+  buildImportedChannel,
+  importChannelLabel,
+  readParquetNumericColumns,
+  resolveImportSampleRate,
+  uniqueChannelLabel,
+} from '../utils/parquetImport'
 import ChannelYRangeDialog from './ChannelYRangeDialog'
 import ExportDataDialog from './ExportDataDialog'
 import SaveEdfConflictDialog from './SaveEdfConflictDialog'
@@ -48,12 +56,14 @@ const VIEWER_TABS = {
   VIEWER: 'viewer',
   CURRENT_VIEW: 'current-view',
   CHANNELS: 'channels',
+  IMPORT: 'import',
 }
 
 const VIEWER_TAB_ITEMS = [
   { id: VIEWER_TABS.VIEWER, label: 'Signal Viewer' },
   { id: VIEWER_TABS.CURRENT_VIEW, label: 'View Format' },
   { id: VIEWER_TABS.CHANNELS, label: 'Channel Select' },
+  { id: VIEWER_TABS.IMPORT, label: 'Import Data' },
 ]
 
 const PLOT_PADDING = { top: 20, right: 20, bottom: 30, left: 70 }
@@ -110,7 +120,8 @@ function getDefaultSelection(channels) {
 }
 
 function isAnnotationChannelId(channelId) {
-  return Number(channelId) >= ANNOTATION_CHANNEL_ID_BASE
+  const id = Number(channelId)
+  return id >= ANNOTATION_CHANNEL_ID_BASE && id < PARQUET_CHANNEL_ID_BASE
 }
 
 function resolveAnnotationBundle(edfData, annotationGroups, totalDuration) {
@@ -466,6 +477,22 @@ function getPlotHeightForPanel(panelHeight) {
       - PLOT_PADDING.bottom
       - OVERVIEW_STRIP_HEIGHT
   )
+}
+
+function getWindowFillingPanelHeight(container) {
+  if (!container) return DEFAULT_PANEL_HEIGHT
+
+  const rect = container.getBoundingClientRect()
+  const timeControls = container.parentElement?.querySelector('.time-controls')
+  const timeHeight = timeControls?.getBoundingClientRect().height ?? 0
+  const marginBottom = parseFloat(getComputedStyle(container).marginBottom) || 0
+  const section = container.closest('.viewer-section')
+  const sectionPaddingBottom = section
+    ? parseFloat(getComputedStyle(section).paddingBottom) || 0
+    : 0
+  const available = window.innerHeight - rect.top - marginBottom - timeHeight - sectionPaddingBottom
+
+  return Math.max(MIN_PANEL_HEIGHT, Math.floor(available))
 }
 
 function distributeChannelStripHeights(activeChannels, channelStripHeights, targetPlotHeight) {
@@ -915,6 +942,7 @@ const SignalViewer = ({ edfData, onBack }) => {
   const [viewStart, setViewStart] = useState(0)
   const [canvasSize, setCanvasSize] = useState({ width: 0, height: 400 })
   const [panelHeight, setPanelHeight] = useState(DEFAULT_PANEL_HEIGHT)
+  const [panelFillsWindow, setPanelFillsWindow] = useState(false)
   const [channelStripHeights, setChannelStripHeights] = useState({})
   const [channelYZoom, setChannelYZoom] = useState({})
   const [channelYRange, setChannelYRange] = useState({})
@@ -922,6 +950,10 @@ const SignalViewer = ({ edfData, onBack }) => {
     getDefaultOverviewChannelId(edfData.channels, getDefaultSelection(edfData.channels))
   )
   const [activeTab, setActiveTab] = useState(VIEWER_TABS.VIEWER)
+  const [importedChannels, setImportedChannels] = useState([])
+  const [importSampleRate, setImportSampleRate] = useState('')
+  const [importError, setImportError] = useState('')
+  const nextImportedIdRef = useRef(PARQUET_CHANNEL_ID_BASE)
   const [savedPresets, setSavedPresets] = useState([])
   const [presetName, setPresetName] = useState('')
   const [presetMessage, setPresetMessage] = useState('')
@@ -967,8 +999,8 @@ const SignalViewer = ({ edfData, onBack }) => {
   )
 
   const allChannels = useMemo(
-    () => [...edfData.channels, ...annotationChannels],
-    [edfData.channels, annotationChannels]
+    () => [...edfData.channels, ...annotationChannels, ...importedChannels],
+    [edfData.channels, annotationChannels, importedChannels]
   )
 
   const channelById = useMemo(
@@ -991,7 +1023,7 @@ const SignalViewer = ({ edfData, onBack }) => {
     const selectedSet = new Set(selectedChannels)
     const selectedOrdered = selectedChannels
       .map((id) => channelById[id])
-      .filter((ch) => ch && !ch.isAnnotationChannel)
+      .filter((ch) => ch && !ch.isAnnotationChannel && !ch.isImported)
     const unselected = edfData.channels.filter((ch) => !selectedSet.has(ch.id))
     return [...selectedOrdered, ...unselected]
   }, [edfData.channels, selectedChannels, channelById])
@@ -1018,6 +1050,15 @@ const SignalViewer = ({ edfData, onBack }) => {
     )
     return [...selectedOrdered, ...rest]
   }, [displayAnnotationGroups, annotationGroups, annotationChannels, selectedChannels])
+
+  const importedChannelsForList = useMemo(() => {
+    const selectedSet = new Set(selectedChannels)
+    const selectedOrdered = selectedChannels
+      .map((id) => channelById[id])
+      .filter((channel) => channel?.isImported)
+    const unselected = importedChannels.filter((channel) => !selectedSet.has(channel.id))
+    return [...selectedOrdered, ...unselected]
+  }, [importedChannels, selectedChannels, channelById])
 
   const canvasHeight = useMemo(
     () => getCanvasHeightForPanel(panelHeight),
@@ -1129,6 +1170,7 @@ const SignalViewer = ({ edfData, onBack }) => {
   }, [allChannels])
 
   const panelHeightRef = useRef(panelHeight)
+  const panelHeightBeforeFillRef = useRef(null)
   const channelStripHeightsRef = useRef(channelStripHeights)
   const channelYZoomRef = useRef(channelYZoom)
   const channelYRangeRef = useRef(channelYRange)
@@ -1190,6 +1232,35 @@ const SignalViewer = ({ edfData, onBack }) => {
     setMaskSelection(null)
     setMaskHistory([])
   }, [edfData.fileName, edfData.savedRecordId])
+
+  useEffect(() => {
+    setImportedChannels([])
+    setImportError('')
+    setSelectedChannels((prev) => {
+      if (!prev.some((id) => id >= PARQUET_CHANNEL_ID_BASE)) return prev
+      return prev.filter((id) => id < PARQUET_CHANNEL_ID_BASE)
+    })
+    setChannelFormats((prev) => {
+      const hasImported = Object.keys(prev).some((id) => Number(id) >= PARQUET_CHANNEL_ID_BASE)
+      if (!hasImported) return prev
+      const next = {}
+      Object.entries(prev).forEach(([id, format]) => {
+        if (Number(id) < PARQUET_CHANNEL_ID_BASE) next[id] = format
+      })
+      return next
+    })
+    setBinaryMaskOverlays((prev) => {
+      const hasImported = Object.keys(prev).some((id) => Number(id) >= PARQUET_CHANNEL_ID_BASE)
+        || Object.values(prev).some((targets) => targets.some((id) => id >= PARQUET_CHANNEL_ID_BASE))
+      if (!hasImported) return prev
+      const next = {}
+      Object.entries(prev).forEach(([id, targets]) => {
+        if (Number(id) >= PARQUET_CHANNEL_ID_BASE) return
+        next[id] = targets.filter((targetId) => targetId < PARQUET_CHANNEL_ID_BASE)
+      })
+      return next
+    })
+  }, [edfData.fileName])
 
   useEffect(() => {
     if (!edfData.savedRecordId) return undefined
@@ -1279,7 +1350,7 @@ const SignalViewer = ({ edfData, onBack }) => {
     if (!recordId) return
 
     const label = channelById[channelId]?.label
-    if (!label) return
+    if (!label || channelById[channelId]?.isImported) return
 
     try {
       await saveBinaryMaskEdit(recordId, label, new Float32Array(data).buffer)
@@ -1314,7 +1385,11 @@ const SignalViewer = ({ edfData, onBack }) => {
   }, [persistMaskToDb, channelById])
 
   const updateMaskAndSave = useCallback((channelId, nextData) => {
-    if (isAnnotationChannelId(channelId) || channelByIdRef.current[channelId]?.isAnnotationChannel) {
+    if (
+      isAnnotationChannelId(channelId)
+      || channelByIdRef.current[channelId]?.isAnnotationChannel
+      || channelByIdRef.current[channelId]?.isImported
+    ) {
       return
     }
     const snapshot = cloneMaskOverrides(maskOverridesRef.current)
@@ -1899,7 +1974,9 @@ const SignalViewer = ({ edfData, onBack }) => {
         ctx.font = '10px Inter, sans-serif'
         ctx.textAlign = 'left'
         ctx.textBaseline = 'top'
-        ctx.fillText('0 / 1 mask · click event to delete, drag to add', padding.left + 4, yTop + 4)
+        if (!channel.isImported) {
+          ctx.fillText('0 / 1 mask · click event to delete, drag to add', padding.left + 4, yTop + 4)
+        }
         ctx.restore()
         return
       }
@@ -1985,6 +2062,98 @@ const SignalViewer = ({ edfData, onBack }) => {
         ? prev.filter((id) => id !== channelId)
         : [...prev, channelId]
     )
+  }
+
+  const handleImportParquetFiles = async (event) => {
+    const fileList = [...(event.target.files ?? [])]
+    event.target.value = ''
+    if (fileList.length === 0) return
+
+    setImportError('')
+    const errors = []
+    const created = []
+    const usedLabels = new Set(allChannels.map((channel) => channel.label))
+
+    for (const file of fileList) {
+      if (!file.name.toLowerCase().endsWith('.parquet')) {
+        errors.push(`"${file.name}" is not a .parquet file`)
+        continue
+      }
+
+      try {
+        const sampleRate = resolveImportSampleRate(file.name, importSampleRate)
+        const columns = await readParquetNumericColumns(await file.arrayBuffer())
+        columns.forEach((column) => {
+          const label = uniqueChannelLabel(
+            importChannelLabel(file.name, column.name, columns.length),
+            usedLabels
+          )
+          const id = nextImportedIdRef.current
+          nextImportedIdRef.current += 1
+          created.push(buildImportedChannel({
+            id,
+            label,
+            data: column.data,
+            sampleRate,
+            sourceFileName: file.name,
+          }))
+        })
+      } catch (error) {
+        errors.push(error.message || `Failed to import "${file.name}"`)
+      }
+    }
+
+    if (created.length > 0) {
+      const binaryIds = created
+        .filter((channel) => isBinarySignal(channel.data))
+        .map((channel) => channel.id)
+
+      setImportedChannels((prev) => [...prev, ...created])
+      setSelectedChannels((prev) => [...prev, ...created.map((channel) => channel.id)])
+      if (binaryIds.length > 0) {
+        setChannelFormats((prev) => {
+          const next = { ...prev }
+          binaryIds.forEach((id) => {
+            next[id] = DEPICTION_FORMATS.BINARY_MASK
+          })
+          return next
+        })
+        setBinaryMaskOverlays((prev) => {
+          const next = { ...prev }
+          const nextFormats = { ...channelFormats }
+          binaryIds.forEach((id) => {
+            nextFormats[id] = DEPICTION_FORMATS.BINARY_MASK
+          })
+          binaryIds.forEach((id) => {
+            next[id] = getDefaultBinaryMaskOverlayTargets(id, selectedChannels, nextFormats)
+          })
+          return next
+        })
+      }
+    }
+
+    if (errors.length > 0) {
+      setImportError(errors.join(' '))
+    }
+  }
+
+  const handleRemoveImportedChannel = (channelId) => {
+    setImportedChannels((prev) => prev.filter((channel) => channel.id !== channelId))
+    setSelectedChannels((prev) => prev.filter((id) => id !== channelId))
+    setChannelFormats((prev) => {
+      if (!(channelId in prev)) return prev
+      const next = { ...prev }
+      delete next[channelId]
+      return next
+    })
+    setBinaryMaskOverlays((prev) => {
+      const next = {}
+      Object.entries(prev).forEach(([id, targets]) => {
+        if (Number(id) === channelId) return
+        next[id] = targets.filter((targetId) => targetId !== channelId)
+      })
+      return next
+    })
   }
 
   const handleFormatChange = (channelId, format) => {
@@ -2444,7 +2613,7 @@ const SignalViewer = ({ edfData, onBack }) => {
 
     const canvas = canvasRef.current
     const channel = channelById[channelId]
-    if (!canvas || !channel || channel.isAnnotationChannel) return
+    if (!canvas || !channel || channel.isAnnotationChannel || channel.isImported) return
 
     const data = maskOverridesRef.current[channelId] ?? channel.data
     const { viewStart: vs, viewEnd: ve } = viewRangeRef.current
@@ -2739,9 +2908,57 @@ const SignalViewer = ({ edfData, onBack }) => {
 
   onDragMoveRef.current = onDragMove
 
+  const applyPanelHeight = useCallback((nextPanelHeight) => {
+    const height = Math.max(MIN_PANEL_HEIGHT, nextPanelHeight)
+    setPanelHeight(height)
+    setChannelStripHeights(
+      distributeChannelStripHeights(
+        activeChannelsRef.current,
+        channelStripHeightsRef.current,
+        getPlotHeightForPanel(height)
+      )
+    )
+  }, [])
+
+  const handleFillPanelToWindow = useCallback(() => {
+    if (panelFillsWindow) {
+      setPanelFillsWindow(false)
+      return
+    }
+
+    panelHeightBeforeFillRef.current = panelHeightRef.current
+    setPanelFillsWindow(true)
+  }, [panelFillsWindow])
+
+  useLayoutEffect(() => {
+    document.body.classList.toggle('signal-viewer-channels-only', panelFillsWindow)
+
+    if (panelFillsWindow) {
+      applyPanelHeight(getWindowFillingPanelHeight(containerRef.current))
+    } else if (panelHeightBeforeFillRef.current != null) {
+      applyPanelHeight(panelHeightBeforeFillRef.current)
+      panelHeightBeforeFillRef.current = null
+    }
+
+    return () => document.body.classList.remove('signal-viewer-channels-only')
+  }, [panelFillsWindow, applyPanelHeight])
+
+  useEffect(() => {
+    if (!panelFillsWindow) return undefined
+
+    const fitToWindow = () => {
+      applyPanelHeight(getWindowFillingPanelHeight(containerRef.current))
+    }
+
+    window.addEventListener('resize', fitToWindow)
+    return () => window.removeEventListener('resize', fitToWindow)
+  }, [panelFillsWindow, applyPanelHeight])
+
   const startPanelResize = useCallback((event) => {
     if (!isPrimaryPointerButton(event)) return
     event.preventDefault()
+    panelHeightBeforeFillRef.current = null
+    setPanelFillsWindow(false)
     dragStateRef.current = {
       type: 'panel',
       startY: event.clientY,
@@ -2811,6 +3028,8 @@ const SignalViewer = ({ edfData, onBack }) => {
     const heights = channelStripHeightsRef.current
     const upperId = channels[channelIndex].id
 
+    panelHeightBeforeFillRef.current = null
+    setPanelFillsWindow(false)
     dragStateRef.current = {
       type: 'channel',
       channelIndex,
@@ -2834,6 +3053,8 @@ const SignalViewer = ({ edfData, onBack }) => {
     const channelId = channels[lastIndex].id
     const heights = channelStripHeightsRef.current
 
+    panelHeightBeforeFillRef.current = null
+    setPanelFillsWindow(false)
     dragStateRef.current = {
       type: 'channel',
       channelIndex: lastIndex,
@@ -2924,8 +3145,9 @@ const SignalViewer = ({ edfData, onBack }) => {
         <div>
           <h2>Signal Viewer</h2>
           <p className="viewer-meta">
-            {edfData.fileName} · {edfData.channels.length} channels
+            {edfData.fileName} ·             {edfData.channels.length} channels
             {annotationChannels.length > 0 ? ` · ${annotationChannels.length} annotation` : ''}
+            {importedChannels.length > 0 ? ` · ${importedChannels.length} imported` : ''}
             {' · '}
             {formatDuration(totalDuration)}
             {edfData.isEdfPlus ? ' · EDF+' : ''}
@@ -3114,7 +3336,7 @@ const SignalViewer = ({ edfData, onBack }) => {
                     })}
                     {channelStripLayouts.map(({ channel, topPercent, heightPercent }) => {
                       if (getChannelFormat(channel.id) !== DEPICTION_FORMATS.BINARY_MASK) return null
-                      if (channel.isAnnotationChannel) return null
+                      if (channel.isAnnotationChannel || channel.isImported) return null
 
                       return (
                         <div
@@ -3163,6 +3385,19 @@ const SignalViewer = ({ edfData, onBack }) => {
                   aria-orientation="horizontal"
                   aria-label="Resize signal viewer panel"
                 />
+                <button
+                  type="button"
+                  className={`panel-fill-cursor${panelFillsWindow ? ' panel-fill-cursor-active' : ''}`}
+                  onPointerDown={(event) => event.stopPropagation()}
+                  onClick={handleFillPanelToWindow}
+                  title={panelFillsWindow ? 'Show Signal Viewer title' : 'Hide title and show channels only'}
+                  aria-pressed={panelFillsWindow}
+                  aria-label={panelFillsWindow ? 'Show Signal Viewer title' : 'Hide title and show channels only'}
+                >
+                  <svg className="panel-fill-cursor-icon" viewBox="0 0 12 18" aria-hidden="true">
+                    <path d="M6 0.5 L1.5 5.5 H4.2 V12.5 H1.5 L6 17.5 L10.5 12.5 H7.8 V5.5 H10.5 Z" />
+                  </svg>
+                </button>
               </div>
 
               <div className="time-controls">
@@ -3336,6 +3571,7 @@ const SignalViewer = ({ edfData, onBack }) => {
                     <option key={channel.id} value={channel.id}>
                       {channel.label}
                       {channel.isAnnotationChannel ? ' (annotation)' : ''}
+                      {channel.isImported ? ' (imported)' : ''}
                     </option>
                   ))}
                 </select>
@@ -3348,6 +3584,19 @@ const SignalViewer = ({ edfData, onBack }) => {
                     <p className="channel-section-empty">No physiological channels</p>
                   ) : (
                     physiologicalChannelsForList.map((channel) => renderChannelSelectItem(channel))
+                  )}
+                </div>
+              </div>
+
+              <div className="channel-section">
+                <h4 className="channel-section-title">Imported channels</h4>
+                <div className="channel-list">
+                  {importedChannelsForList.length === 0 ? (
+                    <p className="channel-section-empty">
+                      No parquet series imported. Use Import Data to add one.
+                    </p>
+                  ) : (
+                    importedChannelsForList.map((channel) => renderChannelSelectItem(channel))
                   )}
                 </div>
               </div>
@@ -3420,6 +3669,78 @@ const SignalViewer = ({ edfData, onBack }) => {
                   </>
                 )}
               </div>
+            </div>
+          </div>
+
+          <div
+            className="viewer-tab-panel viewer-tab-panel-import"
+            role="tabpanel"
+            hidden={activeTab !== VIEWER_TABS.IMPORT}
+          >
+            <div className="parquet-import-panel">
+              <div className="parquet-import-header">
+                <h3>Import Data</h3>
+                <p className="parquet-import-hint">
+                  Load numeric Parquet columns onto this recording. Sample 0 shares time zero
+                  with the EDF. The sample rate is read from the file name (for example 2hz)
+                  unless you set one here.
+                </p>
+              </div>
+
+              <div className="parquet-import-controls">
+                <label className="parquet-import-rate" htmlFor="parquet-sample-rate">
+                  Sample rate override (Hz)
+                  <input
+                    id="parquet-sample-rate"
+                    className="parquet-import-rate-input"
+                    type="number"
+                    min="0"
+                    step="any"
+                    value={importSampleRate}
+                    onChange={(event) => setImportSampleRate(event.target.value)}
+                    placeholder="from filename"
+                  />
+                </label>
+                <label className="btn btn-primary parquet-import-file">
+                  Choose Parquet
+                  <input
+                    type="file"
+                    accept=".parquet,application/vnd.apache.parquet"
+                    multiple
+                    onChange={handleImportParquetFiles}
+                  />
+                </label>
+              </div>
+
+              {importError ? <p className="parquet-import-error">{importError}</p> : null}
+
+              {importedChannels.length === 0 ? (
+                <p className="parquet-import-empty">No imported series yet.</p>
+              ) : (
+                <ul className="parquet-import-list">
+                  {importedChannels.map((channel) => (
+                    <li key={channel.id} className="parquet-import-item">
+                      <div className="parquet-import-info">
+                        <span className="parquet-import-name">{channel.label}</span>
+                        <span className="parquet-import-meta">
+                          {channel.sourceFileName}
+                          {' · '}
+                          {channel.data.length.toLocaleString()} samples
+                          {' · '}
+                          {channel.sampleRate} Hz
+                        </span>
+                      </div>
+                      <button
+                        type="button"
+                        className="btn btn-secondary btn-small"
+                        onClick={() => handleRemoveImportedChannel(channel.id)}
+                      >
+                        Remove
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )}
             </div>
           </div>
         </div>
