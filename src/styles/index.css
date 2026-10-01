@@ -242,7 +242,8 @@ body {
 .viewer-tab-panel-viewer .signal-display {
   border-top: none;
   padding-top: 0;
-  flex: 0 0 auto;
+  flex: 1 1 auto;
+  min-width: 0;
   min-height: auto;
 }
 
@@ -1437,6 +1438,64 @@ body.signal-viewer-mask-editing {
   width: 10px;
   height: 16px;
   fill: currentColor;
+}
+
+.channel-strip-label-select {
+  pointer-events: auto;
+  cursor: pointer;
+  z-index: 2;
+}
+
+.channel-strip-label-chosen {
+  background: rgba(102, 126, 234, 0.18);
+}
+
+.signal-viewer-layout {
+  display: flex;
+  flex-direction: row;
+  align-items: flex-start;
+  min-width: 0;
+  gap: 0.75rem;
+}
+
+.manipulation-drawer {
+  position: relative;
+  flex: 0 0 220px;
+  width: 220px;
+  z-index: 1;
+  padding: 0.75rem 0.75rem 0.75rem 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  background: transparent;
+  border-right: 1px solid #e2e8f0;
+  overflow: visible;
+}
+
+.manipulation-drawer-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.manipulation-drawer h3 {
+  margin: 0;
+  color: #2d3748;
+  font-size: 1rem;
+}
+
+.manipulation-drawer-selection,
+.manipulation-drawer-hint {
+  margin: 0;
+  color: #718096;
+  font-size: 0.85rem;
+  line-height: 1.4;
+}
+
+.manipulation-compose {
+  display: flex;
+  gap: 0.5rem;
 }
 
 body.signal-viewer-channels-only .header,

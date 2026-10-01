@@ -61,21 +61,31 @@ export function importChannelLabel(fileName, columnName, numericColumnCount) {
   return stem
 }
 
+const EDF_LABEL_LENGTH = 16
+
+function fitEdfLabel(label, suffix = '') {
+  const tail = String(suffix)
+  const head = String(label ?? '').trim()
+  const room = EDF_LABEL_LENGTH - tail.length
+  return `${head.slice(0, Math.max(1, room))}${tail}`.slice(0, EDF_LABEL_LENGTH)
+}
+
 /**
  * @param {string} label
  * @param {Set<string>} usedLabels
  */
 export function uniqueChannelLabel(label, usedLabels) {
-  if (!usedLabels.has(label)) {
-    usedLabels.add(label)
-    return label
+  const base = fitEdfLabel(label)
+  if (!usedLabels.has(base)) {
+    usedLabels.add(base)
+    return base
   }
 
   let suffix = 2
-  let next = `${label} (${suffix})`
+  let next = fitEdfLabel(label, `_${suffix}`)
   while (usedLabels.has(next)) {
     suffix += 1
-    next = `${label} (${suffix})`
+    next = fitEdfLabel(label, `_${suffix}`)
   }
   usedLabels.add(next)
   return next
@@ -154,20 +164,20 @@ export function buildImportedChannel({ id, label, data, sampleRate, sourceFileNa
     if (value < physicalMin) physicalMin = value
     if (value > physicalMax) physicalMax = value
   }
-  if (!Number.isFinite(physicalMin) || !Number.isFinite(physicalMax)) {
-    physicalMin = 0
-    physicalMax = 1
-  }
+    if (!Number.isFinite(physicalMin) || !Number.isFinite(physicalMax) || physicalMax <= physicalMin) {
+      physicalMin = Number.isFinite(physicalMin) ? physicalMin : 0
+      physicalMax = physicalMin + 1
+    }
 
-  return {
-    id,
-    label,
-    transducer: 'Parquet import',
-    physicalDimension: '',
-    physicalMin,
-    physicalMax,
-    digitalMin: 0,
-    digitalMax: 1,
+    return {
+      id,
+      label,
+      transducer: 'Parquet import',
+      physicalDimension: '',
+      physicalMin,
+      physicalMax,
+      digitalMin: -32768,
+      digitalMax: 32767,
     prefiltering: '',
     samplesPerRecord: sampleRate,
     sampleRate,

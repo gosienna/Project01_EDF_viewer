@@ -29,8 +29,18 @@ export function buildEdfBuffer(edfData, channelIds, getChannelData, extraChannel
     .filter((channel) => channel && !channel.isAnnotationChannel)
     .map((channel) => {
       if (!channel.isImported) return channel
+      let physicalMin = channel.physicalMin
+      let physicalMax = channel.physicalMax
+      if (!(physicalMax > physicalMin)) {
+        physicalMin = Number.isFinite(physicalMin) ? physicalMin : 0
+        physicalMax = physicalMin + 1
+      }
       return {
         ...channel,
+        physicalMin,
+        physicalMax,
+        digitalMin: -32768,
+        digitalMax: 32767,
         samplesPerRecord: Math.max(1, Math.round(channel.sampleRate * recordDuration)),
       }
     })
@@ -75,6 +85,12 @@ export function buildEdfBuffer(edfData, channelIds, getChannelData, extraChannel
     writeNumberField(bytes, 256 + numSignals * 128 + index * 8, 8, channel.digitalMax)
     writeAsciiField(bytes, 256 + numSignals * 136 + index * 80, 80, channel.prefiltering)
     writeNumberField(bytes, 256 + numSignals * 216 + index * 8, 8, channel.samplesPerRecord)
+    writeAsciiField(
+      bytes,
+      256 + numSignals * 224 + index * 32,
+      32,
+      channel.isImported ? 'parquet' : ''
+    )
   })
 
   let offset = headerBytes

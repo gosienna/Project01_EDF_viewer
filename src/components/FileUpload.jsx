@@ -187,6 +187,9 @@ const FileUpload = ({ onFileUpload, onLoadSavedEdf, isLoading, error }) => {
                     <span className="saved-edf-name">{record.fileName}</span>
                     <span className="saved-edf-meta">
                       {record.summary.channelCount} channels · {formatDuration(record.summary.totalDuration)}
+                      {record.summary.importedChannelLabels?.length
+                        ? ` · ${record.summary.importedChannelLabels.length} imported`
+                        : ''}
                       {record.summary.isEdfPlus ? ' · EDF+' : ''}
                       {' · '}{formatFileSize(record.fileSizeBytes)}
                       {' · Saved '}{formatSavedAt(record.savedAt)}

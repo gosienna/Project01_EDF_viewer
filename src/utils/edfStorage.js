@@ -11,6 +11,7 @@ export function buildEdfSummary(edfData) {
     totalDuration: edfData.totalDuration,
     isEdfPlus: edfData.isEdfPlus,
     channelLabels: edfData.channels.map((ch) => ch.label),
+    importedChannelLabels: edfData.channels.filter((ch) => ch.isImported).map((ch) => ch.label),
   }
 }
 

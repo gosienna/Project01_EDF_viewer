@@ -45,6 +45,15 @@ const DEPICTION_FORMATS = {
   BINARY_MASK: 'binary_mask',
 }
 
+const COMPOSE_MODES = {
+  BACKDROP: 'backdrop',
+  OVERLAY: 'overlay',
+}
+
+const OVERLAY_RANGE_KEY = 'overlay'
+const OVERLAY_LINE_ALPHA = 0.55
+const SELECTION_HIGHLIGHT = 'rgba(102, 126, 234, 0.16)'
+
 const DEPICTION_OPTIONS = [
   { value: DEPICTION_FORMATS.SEQUENCE, label: 'Sequence' },
   { value: DEPICTION_FORMATS.BINARY_MASK, label: 'Binary mask' },
@@ -586,6 +595,66 @@ function getChannelDisplayRange({
   return { displayMin, displayMax, displayRange, isCustom: false, samples }
 }
 
+function hexToRgba(hex, alpha) {
+  const value = String(hex).replace('#', '')
+  const r = parseInt(value.slice(0, 2), 16)
+  const g = parseInt(value.slice(2, 4), 16)
+  const b = parseInt(value.slice(4, 6), 16)
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`
+}
+
+function buildDisplayStrips(channels, manipulationIds, composeMode) {
+  const asChannelStrip = (channel) => ({
+    kind: 'channel',
+    key: String(channel.id),
+    channels: [channel],
+    resizeChannelId: channel.id,
+  })
+
+  if (composeMode !== COMPOSE_MODES.OVERLAY || manipulationIds.length === 0) {
+    return channels.map(asChannelStrip)
+  }
+
+  const selected = new Set(manipulationIds)
+  const members = []
+  let placed = false
+  const strips = []
+
+  channels.forEach((channel) => {
+    if (!selected.has(channel.id)) {
+      strips.push(asChannelStrip(channel))
+      return
+    }
+    members.push(channel)
+    if (!placed) {
+      strips.push(null)
+      placed = true
+    }
+  })
+
+  if (members.length === 0) return channels.map(asChannelStrip)
+
+  const group = {
+    kind: 'overlay',
+    key: OVERLAY_RANGE_KEY,
+    channels: members,
+    resizeChannelId: members[members.length - 1].id,
+  }
+  return strips.map((strip) => strip ?? group)
+}
+
+function getDisplayStripHeight(strip, channelStripHeights) {
+  return strip.channels.reduce(
+    (sum, channel) => sum + getChannelStripHeight(channelStripHeights, channel.id),
+    0
+  )
+}
+
+function channelColorIndex(channel, activeChannels) {
+  const index = activeChannels.findIndex((item) => item.id === channel.id)
+  return index >= 0 ? index : 0
+}
+
 function clipToChannelStrip(ctx, xLeft, plotWidth, yTop, stripHeight) {
   ctx.save()
   ctx.beginPath()
@@ -703,6 +772,8 @@ function buildViewParams({
   activeTab,
   annotationGroups,
   allChannels,
+  overlayMemberIds,
+  composeMode,
 }) {
   const channelById = Object.fromEntries(
     (allChannels ?? [...edfData.channels]).map((ch) => [ch.id, ch])
@@ -743,6 +814,10 @@ function buildViewParams({
     viewStart,
     panelHeight,
     activeTab,
+    overlayChannelLabels: (overlayMemberIds ?? [])
+      .map((id) => channelById[id]?.label)
+      .filter(Boolean),
+    composeMode: composeMode === COMPOSE_MODES.OVERLAY ? COMPOSE_MODES.OVERLAY : COMPOSE_MODES.BACKDROP,
   }
 }
 
@@ -772,6 +847,10 @@ function normalizeViewParams(params) {
     viewStart: params.viewStart,
     panelHeight: params.panelHeight ?? DEFAULT_PANEL_HEIGHT,
     activeTab: resolveActiveTab(params),
+    overlayChannelLabels: [...(params.overlayChannelLabels ?? [])],
+    composeMode: params.composeMode === COMPOSE_MODES.OVERLAY
+      ? COMPOSE_MODES.OVERLAY
+      : COMPOSE_MODES.BACKDROP,
   }
 }
 
@@ -792,6 +871,8 @@ function resolveFullViewParams(params, edfData, totalDuration) {
     activeTab: applied.activeTab,
     annotationGroups: applied.annotationGroups,
     allChannels: applied.allChannels,
+    overlayMemberIds: applied.overlayMemberIds,
+    composeMode: applied.composeMode,
   })
 }
 
@@ -889,6 +970,13 @@ function applyViewParams(params, edfData, totalDuration) {
     overviewChannelId = getDefaultOverviewChannelId(allChannels, selectedChannelsResult)
   }
 
+  const overlayMemberIds = (params.overlayChannelLabels ?? [])
+    .map((label) => labelToId[label])
+    .filter((id) => id !== undefined)
+  const composeMode = params.composeMode === COMPOSE_MODES.OVERLAY && overlayMemberIds.length >= 2
+    ? COMPOSE_MODES.OVERLAY
+    : COMPOSE_MODES.BACKDROP
+
   Object.entries(formats).forEach(([id, format]) => {
     if (format !== DEPICTION_FORMATS.BINARY_MASK) return
     const channelId = Number(id)
@@ -915,6 +1003,8 @@ function applyViewParams(params, edfData, totalDuration) {
     activeTab: resolveActiveTab(params),
     annotationGroups: groups,
     allChannels,
+    overlayMemberIds,
+    composeMode,
   }
 }
 
@@ -943,6 +1033,10 @@ const SignalViewer = ({ edfData, onBack }) => {
   const [canvasSize, setCanvasSize] = useState({ width: 0, height: 400 })
   const [panelHeight, setPanelHeight] = useState(DEFAULT_PANEL_HEIGHT)
   const [panelFillsWindow, setPanelFillsWindow] = useState(false)
+  const [manipulationIds, setManipulationIds] = useState([])
+  const [overlayMemberIds, setOverlayMemberIds] = useState([])
+  const [compareMode, setCompareMode] = useState(false)
+  const [composeMode, setComposeMode] = useState(COMPOSE_MODES.BACKDROP)
   const [channelStripHeights, setChannelStripHeights] = useState({})
   const [channelYZoom, setChannelYZoom] = useState({})
   const [channelYRange, setChannelYRange] = useState({})
@@ -1024,7 +1118,7 @@ const SignalViewer = ({ edfData, onBack }) => {
     const selectedOrdered = selectedChannels
       .map((id) => channelById[id])
       .filter((ch) => ch && !ch.isAnnotationChannel && !ch.isImported)
-    const unselected = edfData.channels.filter((ch) => !selectedSet.has(ch.id))
+    const unselected = edfData.channels.filter((ch) => !selectedSet.has(ch.id) && !ch.isImported)
     return [...selectedOrdered, ...unselected]
   }, [edfData.channels, selectedChannels, channelById])
 
@@ -1053,12 +1147,17 @@ const SignalViewer = ({ edfData, onBack }) => {
 
   const importedChannelsForList = useMemo(() => {
     const selectedSet = new Set(selectedChannels)
+    const persistedImported = edfData.channels.filter((channel) => channel.isImported)
+    const sessionIds = new Set(importedChannels.map((channel) => channel.id))
     const selectedOrdered = selectedChannels
       .map((id) => channelById[id])
       .filter((channel) => channel?.isImported)
-    const unselected = importedChannels.filter((channel) => !selectedSet.has(channel.id))
+    const unselected = [
+      ...persistedImported.filter((channel) => !sessionIds.has(channel.id) && !selectedSet.has(channel.id)),
+      ...importedChannels.filter((channel) => !selectedSet.has(channel.id)),
+    ]
     return [...selectedOrdered, ...unselected]
-  }, [importedChannels, selectedChannels, channelById])
+  }, [edfData.channels, importedChannels, selectedChannels, channelById])
 
   const canvasHeight = useMemo(
     () => getCanvasHeightForPanel(panelHeight),
@@ -1069,6 +1168,21 @@ const SignalViewer = ({ edfData, onBack }) => {
     () => activeChannels.map((channel) => channel.id).join(','),
     [activeChannels]
   )
+
+  const plotChannels = useMemo(() => {
+    if (!compareMode) return activeChannels
+    const sourceIds = manipulationIds.length > 0 ? manipulationIds : overlayMemberIds
+    return sourceIds
+      .map((id) => activeChannels.find((channel) => channel.id === id))
+      .filter(Boolean)
+  }, [compareMode, activeChannels, manipulationIds, overlayMemberIds])
+
+  const displayStrips = useMemo(
+    () => buildDisplayStrips(plotChannels, overlayMemberIds, composeMode),
+    [plotChannels, overlayMemberIds, composeMode]
+  )
+
+  const manipulationSet = useMemo(() => new Set(manipulationIds), [manipulationIds])
 
   const channelBoundaries = useMemo(
     () => getChannelBoundaryPercents(activeChannels, channelStripHeights, canvasHeight),
@@ -1085,6 +1199,36 @@ const SignalViewer = ({ edfData, onBack }) => {
     [activeChannels, channelStripHeights, canvasHeight]
   )
 
+  const displayStripLayouts = useMemo(() => {
+    if (displayStrips.length === 0 || canvasHeight <= 0) return []
+
+    let offset = getDetailChannelsTop()
+    return displayStrips.map((strip) => {
+      const height = getDisplayStripHeight(strip, channelStripHeights)
+      const layout = {
+        strip,
+        topPercent: (offset / canvasHeight) * 100,
+        heightPercent: (height / canvasHeight) * 100,
+      }
+      offset += height
+      return layout
+    })
+  }, [displayStrips, channelStripHeights, canvasHeight])
+
+  const displayBoundaries = useMemo(
+    () => displayStripLayouts.slice(0, -1).map((layout, stripIndex) => ({
+      stripIndex,
+      percent: layout.topPercent + layout.heightPercent,
+    })),
+    [displayStripLayouts]
+  )
+
+  const displayLastBottomPercent = useMemo(() => {
+    const last = displayStripLayouts[displayStripLayouts.length - 1]
+    if (!last) return null
+    return last.topPercent + last.heightPercent
+  }, [displayStripLayouts])
+
   const overviewStripLayout = useMemo(
     () => getOverviewStripLayout(canvasHeight),
     [canvasHeight]
@@ -1097,6 +1241,36 @@ const SignalViewer = ({ edfData, onBack }) => {
     const fallbackId = getDefaultOverviewChannelId(allChannels, selectedChannels)
     return fallbackId !== null ? channelById[fallbackId] ?? null : null
   }, [overviewChannelId, channelById, allChannels, selectedChannels])
+
+  const displayStripsRef = useRef(displayStrips)
+  const composeModeRef = useRef(composeMode)
+
+  useEffect(() => {
+    displayStripsRef.current = displayStrips
+  }, [displayStrips])
+
+  useEffect(() => {
+    composeModeRef.current = composeMode
+  }, [composeMode])
+
+  useEffect(() => {
+    const visible = new Set(selectedChannels)
+    setManipulationIds((prev) => {
+      const next = prev.filter((id) => visible.has(id))
+      return next.length === prev.length ? prev : next
+    })
+    setOverlayMemberIds((prev) => {
+      const next = prev.filter((id) => visible.has(id))
+      if (next.length < 2) return prev.length === 0 ? prev : []
+      return next.length === prev.length ? prev : next
+    })
+  }, [selectedChannels])
+
+  useEffect(() => {
+    if (overlayMemberIds.length < 2 && composeMode === COMPOSE_MODES.OVERLAY) {
+      setComposeMode(COMPOSE_MODES.BACKDROP)
+    }
+  }, [overlayMemberIds, composeMode])
 
   const previousAllChannelsRef = useRef(allChannels)
 
@@ -1446,6 +1620,8 @@ const SignalViewer = ({ edfData, onBack }) => {
     setWindowSeconds(next.windowSeconds)
     setViewStart(next.viewStart)
     setPanelHeight(next.panelHeight)
+    setOverlayMemberIds(next.overlayMemberIds)
+    setComposeMode(next.composeMode)
     setLoadedPresetId(preset.id)
     setActiveTab(next.activeTab)
     setPresetError('')
@@ -1493,6 +1669,8 @@ const SignalViewer = ({ edfData, onBack }) => {
         activeTab,
         annotationGroups,
         allChannels,
+        overlayMemberIds,
+        composeMode,
       }),
     [
       edfData,
@@ -1509,6 +1687,8 @@ const SignalViewer = ({ edfData, onBack }) => {
       activeTab,
       annotationGroups,
       allChannels,
+      overlayMemberIds,
+      composeMode,
     ]
   )
 
@@ -1545,6 +1725,50 @@ const SignalViewer = ({ edfData, onBack }) => {
   )
 
   const readChannelDisplayRange = useCallback((channelId) => {
+    if (channelId === OVERLAY_RANGE_KEY) {
+      const group = displayStripsRef.current.find((strip) => strip.kind === 'overlay')
+      if (!group) return null
+      const sequenceMembers = group.channels.filter(
+        (member) => getChannelFormat(member.id) !== DEPICTION_FORMATS.BINARY_MASK
+      )
+      const axisMembers = sequenceMembers.length > 0 ? sequenceMembers : group.channels
+      const plotWidth = getChannelPlotWidth()
+      const { viewStart: rangeStart, viewEnd: rangeEnd } = viewRangeRef.current
+      let minVal = Infinity
+      let maxVal = -Infinity
+      axisMembers.forEach((member) => {
+        const samples = downsampleRange(
+          getMaskData(member.id),
+          rangeStart * member.sampleRate,
+          rangeEnd * member.sampleRate,
+          plotWidth
+        )
+        samples.forEach(({ min, max }) => {
+          if (min < minVal) minVal = min
+          if (max > maxVal) maxVal = max
+        })
+      })
+      if (!Number.isFinite(minVal) || !Number.isFinite(maxVal)) {
+        minVal = 0
+        maxVal = 1
+      }
+      const override = channelYRangeRef.current[OVERLAY_RANGE_KEY]
+      if (
+        override
+        && Number.isFinite(override.min)
+        && Number.isFinite(override.max)
+        && override.min < override.max
+      ) {
+        return {
+          displayMin: override.min,
+          displayMax: override.max,
+          displayRange: override.max - override.min,
+        }
+      }
+      const yZoom = channelYZoomRef.current[OVERLAY_RANGE_KEY] ?? DEFAULT_Y_ZOOM
+      return getVisibleValueRange(minVal, maxVal, yZoom)
+    }
+
     const channel = channelById[channelId]
     if (!channel) return null
 
@@ -1556,18 +1780,21 @@ const SignalViewer = ({ edfData, onBack }) => {
       channelYZoom: channelYZoomRef.current,
       channelYRange: channelYRangeRef.current,
     })
-  }, [channelById, getChannelPlotWidth])
+  }, [channelById, getChannelPlotWidth, getChannelFormat, getMaskData])
 
   const openYRangeDialog = useCallback((channelId) => {
-    const channel = channelById[channelId]
-    if (!channel || getChannelFormat(channelId) === DEPICTION_FORMATS.BINARY_MASK) return
+    if (channelId !== OVERLAY_RANGE_KEY && getChannelFormat(channelId) === DEPICTION_FORMATS.BINARY_MASK) return
 
     const display = readChannelDisplayRange(channelId)
     if (!display) return
 
+    const channel = channelById[channelId]
+    const group = displayStripsRef.current.find((strip) => strip.kind === 'overlay')
     setYRangeDialog({
       channelId,
-      channelLabel: channel.label,
+      channelLabel: channelId === OVERLAY_RANGE_KEY
+        ? (group?.channels.map((member) => member.label).join(', ') || 'Overlay')
+        : channel?.label ?? '',
       min: display.displayMin,
       max: display.displayMax,
     })
@@ -1606,7 +1833,7 @@ const SignalViewer = ({ edfData, onBack }) => {
   }, [yRangeDialog])
 
   const handleChannelYRangeContextMenu = useCallback((event, channelId) => {
-    if (getChannelFormat(channelId) === DEPICTION_FORMATS.BINARY_MASK) return
+    if (channelId !== OVERLAY_RANGE_KEY && getChannelFormat(channelId) === DEPICTION_FORMATS.BINARY_MASK) return
     event.preventDefault()
     event.stopPropagation()
     openYRangeDialog(channelId)
@@ -1675,24 +1902,32 @@ const SignalViewer = ({ edfData, onBack }) => {
   const buildMergedEdfBuffer = useCallback(() => {
     const getData = (channelId) => getMaskData(channelId)
     const hasMaskEdits = Object.keys(maskOverridesRef.current).length > 0
+    const hasImported = importedChannels.length > 0
 
-    if (!hasMaskEdits && edfData.rawBuffer) {
+    if (!hasMaskEdits && !hasImported && edfData.rawBuffer) {
       return edfData.rawBuffer
     }
 
     return buildEdfBuffer(
       edfData,
-      edfData.channels.map((channel) => channel.id),
-      getData
+      [
+        ...edfData.channels.map((channel) => channel.id),
+        ...importedChannels.map((channel) => channel.id),
+      ],
+      getData,
+      importedChannels
     )
-  }, [edfData, getMaskData])
+  }, [edfData, getMaskData, importedChannels])
 
   const performSaveEdf = useCallback(async ({ replaceRecordIds = [], saveAsNew = false } = {}) => {
     setEdfSaveError('')
     setEdfSaveMessage('')
 
     const mergedBuffer = buildMergedEdfBuffer()
-    const summary = buildEdfSummary(edfData)
+    const summary = buildEdfSummary({
+      ...edfData,
+      channels: [...edfData.channels, ...importedChannels],
+    })
     const fileName = edfData.fileName
 
     for (const recordId of replaceRecordIds) {
@@ -1717,7 +1952,7 @@ const SignalViewer = ({ edfData, onBack }) => {
         : `Saved "${fileName}" to IndexedDB`
     )
     return id
-  }, [edfData, buildMergedEdfBuffer, persistAllMaskOverrides])
+  }, [edfData, importedChannels, buildMergedEdfBuffer, persistAllMaskOverrides])
 
   const resolveSaveEdfPromise = useCallback((error = null) => {
     const resolvers = saveEdfResolversRef.current
@@ -1775,7 +2010,11 @@ const SignalViewer = ({ edfData, onBack }) => {
     setEdfSaveError('')
     setEdfSaveMessage('')
 
-    if (!edfData.rawBuffer && Object.keys(maskOverridesRef.current).length === 0) {
+    if (
+      !edfData.rawBuffer
+      && Object.keys(maskOverridesRef.current).length === 0
+      && importedChannels.length === 0
+    ) {
       const error = new Error('No raw file data available to save')
       setEdfSaveError(error.message)
       throw error
@@ -1803,8 +2042,8 @@ const SignalViewer = ({ edfData, onBack }) => {
   }
 
   const hasPendingExportChanges = useMemo(
-    () => Object.keys(maskOverrides).length > 0 || !savedRecordId,
-    [maskOverrides, savedRecordId]
+    () => Object.keys(maskOverrides).length > 0 || !savedRecordId || importedChannels.length > 0,
+    [maskOverrides, savedRecordId, importedChannels]
   )
 
   useEffect(() => {
@@ -1851,10 +2090,6 @@ const SignalViewer = ({ edfData, onBack }) => {
     ctx.fillStyle = '#ffffff'
     ctx.fillRect(0, 0, width, height)
 
-    const activeChannelsToDraw = selectedChannels
-      .map((id) => channelById[id])
-      .filter(Boolean)
-
     if (overviewChannel) {
       drawOverviewStrip(ctx, {
         channel: overviewChannel,
@@ -1870,7 +2105,7 @@ const SignalViewer = ({ edfData, onBack }) => {
       })
     }
 
-    if (activeChannelsToDraw.length === 0) {
+    if (displayStrips.length === 0) {
       ctx.fillStyle = '#718096'
       ctx.font = '16px Inter, sans-serif'
       ctx.textAlign = 'center'
@@ -1893,13 +2128,145 @@ const SignalViewer = ({ edfData, onBack }) => {
 
     let yOffset = getDetailChannelsTop()
 
-    activeChannelsToDraw.forEach((channel, stripIndex) => {
-      const stripHeight = getChannelStripHeight(channelStripHeights, channel.id)
+    const drawSeriesStroke = (samples, yTop, yBottom, stripHeight, displayMin, displayRange, strokeStyle) => {
+      ctx.strokeStyle = strokeStyle
+      ctx.lineWidth = 1.5
+      ctx.beginPath()
+      samples.forEach((point, index) => {
+        const x = padding.left + (index / Math.max(samples.length - 1, 1)) * plotWidth
+        const yMin = yBottom - 8 - ((point.min - displayMin) / displayRange) * (stripHeight - 16)
+        const yMax = yBottom - 8 - ((point.max - displayMin) / displayRange) * (stripHeight - 16)
+
+        if (index === 0) {
+          ctx.moveTo(x, yMin)
+        } else {
+          ctx.lineTo(x, yMin)
+        }
+        if (Math.abs(yMax - yMin) > 0.5) {
+          ctx.lineTo(x, yMax)
+        }
+      })
+      ctx.stroke()
+    }
+
+    const drawOverlayStrip = (strip, yTop, yBottom, stripHeight) => {
+      const sequenceMembers = strip.channels.filter(
+        (member) => getChannelFormat(member.id) !== DEPICTION_FORMATS.BINARY_MASK
+      )
+      const axisMembers = sequenceMembers.length > 0 ? sequenceMembers : strip.channels
+      let minVal = Infinity
+      let maxVal = -Infinity
+      const series = axisMembers.map((member) => {
+        const data = getMaskData(member.id)
+        const samples = downsampleRange(
+          data,
+          viewStart * member.sampleRate,
+          viewEnd * member.sampleRate,
+          plotWidth
+        )
+        samples.forEach(({ min, max }) => {
+          if (min < minVal) minVal = min
+          if (max > maxVal) maxVal = max
+        })
+        return { member, samples }
+      })
+
+      const override = channelYRange[OVERLAY_RANGE_KEY]
+      const hasCustomRange = override
+        && Number.isFinite(override.min)
+        && Number.isFinite(override.max)
+        && override.min < override.max
+      const yZoom = channelYZoom[OVERLAY_RANGE_KEY] ?? DEFAULT_Y_ZOOM
+      let displayMin = 0
+      let displayMax = 1
+      let displayRange = 1
+      if (hasCustomRange) {
+        displayMin = override.min
+        displayMax = override.max
+        displayRange = override.max - override.min
+      } else if (Number.isFinite(minVal) && Number.isFinite(maxVal)) {
+        const range = getVisibleValueRange(minVal, maxVal, yZoom)
+        displayMin = range.displayMin
+        displayMax = range.displayMax
+        displayRange = range.displayRange
+      }
+
+      ctx.strokeStyle = '#edf2f7'
+      ctx.lineWidth = 1
+      ctx.beginPath()
+      ctx.moveTo(padding.left, (yTop + yBottom) / 2)
+      ctx.lineTo(width - padding.right, (yTop + yBottom) / 2)
+      ctx.stroke()
+
+      clipToChannelStrip(ctx, padding.left, plotWidth, yTop, stripHeight)
+
+      strip.channels.forEach((member) => {
+        if (getChannelFormat(member.id) !== DEPICTION_FORMATS.BINARY_MASK) return
+        const segments = getBinaryMaskSegments(
+          getMaskData(member.id),
+          viewStart * member.sampleRate,
+          viewEnd * member.sampleRate,
+          plotWidth
+        )
+        const colorIndex = channelColorIndex(member, activeChannels)
+        const color = hexToRgba(CHANNEL_COLORS[colorIndex % CHANNEL_COLORS.length], 0.28)
+        drawBinaryMaskSegments(
+          ctx,
+          segments,
+          padding.left,
+          plotWidth,
+          yTop + 2,
+          yBottom - 2,
+          color,
+          null
+        )
+      })
+
+      series.forEach(({ member, samples }) => {
+        if (samples.length === 0) return
+        const colorIndex = channelColorIndex(member, activeChannels)
+        const color = hexToRgba(
+          CHANNEL_COLORS[colorIndex % CHANNEL_COLORS.length],
+          OVERLAY_LINE_ALPHA
+        )
+        drawSeriesStroke(samples, yTop, yBottom, stripHeight, displayMin, displayRange, color)
+      })
+
+      ctx.fillStyle = '#a0aec0'
+      ctx.font = '10px Inter, sans-serif'
+      ctx.textAlign = 'left'
+      ctx.textBaseline = 'top'
+      const zoomLabel = !hasCustomRange && yZoom !== DEFAULT_Y_ZOOM ? ` · ${yZoom.toFixed(1)}x` : ''
+      const customLabel = hasCustomRange ? ' · fixed' : ''
+      ctx.fillText(
+        `${displayMin.toFixed(1)} – ${displayMax.toFixed(1)}${zoomLabel}${customLabel}`,
+        padding.left + 4,
+        yTop + 4
+      )
+      ctx.restore()
+    }
+
+    displayStrips.forEach((strip) => {
+      const channel = strip.channels[0]
+      const stripHeight = getDisplayStripHeight(strip, channelStripHeights)
       const yTop = yOffset
       const yBottom = yTop + stripHeight
       yOffset = yBottom
       const yMid = (yTop + yBottom) / 2
       const format = getChannelFormat(channel.id)
+      const highlighted = strip.kind === 'overlay'
+        ? strip.channels.every((member) => manipulationSet.has(member.id))
+        : manipulationSet.has(channel.id)
+
+      if (highlighted) {
+        ctx.fillStyle = SELECTION_HIGHLIGHT
+        ctx.fillRect(0, yTop, width, stripHeight)
+      }
+
+      if (strip.kind === 'overlay') {
+        drawOverlayStrip(strip, yTop, yBottom, stripHeight)
+        return
+      }
 
       ctx.strokeStyle = '#edf2f7'
       ctx.lineWidth = 1
@@ -2002,7 +2369,7 @@ const SignalViewer = ({ edfData, onBack }) => {
       }
 
       const yZoom = channelYZoom[channel.id] ?? DEFAULT_Y_ZOOM
-      const color = CHANNEL_COLORS[stripIndex % CHANNEL_COLORS.length]
+      const color = CHANNEL_COLORS[channelColorIndex(channel, activeChannels) % CHANNEL_COLORS.length]
 
       ctx.strokeStyle = color
       ctx.lineWidth = 1.5
@@ -2048,13 +2415,44 @@ const SignalViewer = ({ edfData, onBack }) => {
       width / 2,
       height - 20
     )
-  }, [edfData, selectedChannels, channelById, channelFormats, channelStripHeights, channelYZoom, channelYRange, overviewChannel, binaryMaskChannels, getChannelFormat, getBinaryMaskOverlayTargets, getMaskData, maskSelection, viewStart, viewEnd, windowSeconds, totalDuration, canvasSize.width, canvasSize.height])
+  }, [edfData, displayStrips, activeChannels, manipulationSet, channelById, channelFormats, channelStripHeights, channelYZoom, channelYRange, overviewChannel, binaryMaskChannels, getChannelFormat, getBinaryMaskOverlayTargets, getMaskData, maskSelection, viewStart, viewEnd, windowSeconds, totalDuration, canvasSize.width, canvasSize.height])
 
   useEffect(() => {
     if (canvasSize.width > 0) {
       drawSignals()
     }
   }, [drawSignals, canvasSize])
+
+  const selectionIsOverlayGroup = overlayMemberIds.length > 1
+    && manipulationIds.length === overlayMemberIds.length
+    && overlayMemberIds.every((id) => manipulationIds.includes(id))
+
+  const applyChannelOverlay = useCallback(() => {
+    if (manipulationIds.length < 2) return
+    setOverlayMemberIds([...manipulationIds])
+    setComposeMode(COMPOSE_MODES.OVERLAY)
+    setManipulationIds([])
+  }, [manipulationIds])
+
+  const revertChannelOverlay = useCallback(() => {
+    setComposeMode(COMPOSE_MODES.BACKDROP)
+    setOverlayMemberIds([])
+    setManipulationIds([])
+  }, [])
+
+  const toggleManipulation = useCallback((channelIds) => {
+    setManipulationIds((prev) => {
+      const selected = new Set(prev)
+      const allSelected = channelIds.every((id) => selected.has(id))
+      if (allSelected) return prev.filter((id) => !channelIds.includes(id))
+      const next = [...prev]
+      channelIds.forEach((id) => {
+        if (!selected.has(id)) next.push(id)
+      })
+      return next
+    })
+    setActiveTab(VIEWER_TABS.VIEWER)
+  }, [])
 
   const handleChannelToggle = (channelId) => {
     setSelectedChannels((prev) =>
@@ -2343,6 +2741,7 @@ const SignalViewer = ({ edfData, onBack }) => {
         <span className="channel-meta">
           {channel.sampleRate.toFixed(1)} Hz
           {channel.physicalDimension ? ` · ${channel.physicalDimension}` : ''}
+          {channel.isImported ? ' · imported' : ''}
           {isBinary ? ' · binary' : ''}
         </span>
         <select
@@ -2726,18 +3125,11 @@ const SignalViewer = ({ edfData, onBack }) => {
   }, [overviewStripLayout, overviewChannel])
 
   const handleChannelYZoomWheel = useCallback((event, channelId) => {
-    const channel = channelById[channelId]
-    if (!channel) return
+    if (!channelById[channelId] && channelId !== OVERLAY_RANGE_KEY) return
 
     const zoomFactor = Y_WHEEL_ZOOM_BASE ** (-event.deltaY / 100)
-    const display = getChannelDisplayRange({
-      channel,
-      viewStart: viewRangeRef.current.viewStart,
-      viewEnd: viewRangeRef.current.viewEnd,
-      plotWidth: Math.max(canvasSize.width - PLOT_PADDING.left - PLOT_PADDING.right, 1),
-      channelYZoom: channelYZoomRef.current,
-      channelYRange: channelYRangeRef.current,
-    })
+    const display = readChannelDisplayRange(channelId)
+    if (!display) return
 
     if (channelYRangeRef.current[channelId]) {
       const center = (display.displayMin + display.displayMax) / 2
@@ -2758,7 +3150,7 @@ const SignalViewer = ({ edfData, onBack }) => {
       if (next === current) return prev
       return { ...prev, [channelId]: next }
     })
-  }, [channelById, canvasSize.width])
+  }, [channelById, readChannelDisplayRange])
 
   const handleChannelYZoomWheelRef = useRef(handleChannelYZoomWheel)
   handleChannelYZoomWheelRef.current = handleChannelYZoomWheel
@@ -2781,7 +3173,7 @@ const SignalViewer = ({ edfData, onBack }) => {
 
     wrap.addEventListener('wheel', handleWheel, { passive: false, capture: true })
     return () => wrap.removeEventListener('wheel', handleWheel, { capture: true })
-  }, [activeTab, channelStripLayouts.length])
+  }, [activeTab, displayStripLayouts.length])
 
   const endDrag = useCallback(() => {
     const wasReordering = dragStateRef.current?.type === 'channel-reorder'
@@ -2834,7 +3226,8 @@ const SignalViewer = ({ edfData, onBack }) => {
       const deltaCanvas = (event.clientY - drag.startY) * scaleY
       if (Math.abs(deltaCanvas) < 0.5) return
 
-      const upperId = channels[drag.channelIndex].id
+      const upperId = drag.resizeChannelId ?? channels[drag.channelIndex]?.id
+      if (upperId === undefined) return
       const nextUpperHeight = Math.max(
         MIN_CHANNEL_STRIP_HEIGHT,
         drag.startUpperHeight + deltaCanvas
@@ -2857,19 +3250,30 @@ const SignalViewer = ({ edfData, onBack }) => {
 
     if (drag.type === 'channel-reorder') {
       const canvas = canvasRef.current
-      const channels = activeChannelsRef.current
-      if (!canvas || channels.length < 2) return
+      const strips = displayStripsRef.current
+      if (!canvas || strips.length < 2 || composeModeRef.current === COMPOSE_MODES.OVERLAY) return
 
-      const targetIndex = getChannelIndexAtCanvasY(
-        event.clientY,
-        canvas,
-        channels,
-        channelStripHeightsRef.current
-      )
+      const rect = canvas.getBoundingClientRect()
+      if (rect.height <= 0) return
+      const scaleY = canvas.height / rect.height
+      const canvasY = (event.clientY - rect.top) * scaleY
+      let offset = getDetailChannelsTop()
+      let targetStripIndex = strips.length - 1
+      for (let i = 0; i < strips.length; i += 1) {
+        const height = getDisplayStripHeight(strips[i], channelStripHeightsRef.current)
+        if (canvasY < offset + height / 2) {
+          targetStripIndex = i
+          break
+        }
+        offset += height
+      }
+
+      const targetId = strips[targetStripIndex].channels[0].id
       const fromIndex = selectedChannelsRef.current.indexOf(drag.channelId)
-      if (fromIndex === -1 || fromIndex === targetIndex) return
+      const toIndex = selectedChannelsRef.current.indexOf(targetId)
+      if (fromIndex === -1 || toIndex === -1 || fromIndex === toIndex) return
 
-      const next = reorderArray(selectedChannelsRef.current, fromIndex, targetIndex)
+      const next = reorderArray(selectedChannelsRef.current, fromIndex, toIndex)
       selectedChannelsRef.current = next
       activeChannelsRef.current = next
         .map((id) => channelByIdRef.current[id])
@@ -2999,7 +3403,10 @@ const SignalViewer = ({ edfData, onBack }) => {
     }
 
     const display = readChannelDisplayRange(channelId)
-    const stripHeight = getChannelStripHeight(channelStripHeightsRef.current, channelId)
+    const strip = displayStripsRef.current.find((item) => item.key === String(channelId))
+    const stripHeight = strip
+      ? getDisplayStripHeight(strip, channelStripHeightsRef.current)
+      : getChannelStripHeight(channelStripHeightsRef.current, channelId)
     if (!display || stripHeight <= 0) return
 
     dragStateRef.current = {
@@ -3017,24 +3424,25 @@ const SignalViewer = ({ edfData, onBack }) => {
     attachDocumentDragListeners(onDragMoveRef.current, endDragRef.current)
   }, [readChannelDisplayRange])
 
-  const startChannelResize = useCallback((event, channelIndex) => {
+  const startChannelResize = useCallback((event, stripIndex) => {
     if (!isPrimaryPointerButton(event)) return
     event.preventDefault()
     event.stopPropagation()
 
-    const channels = activeChannelsRef.current
-    if (channels.length <= channelIndex + 1) return
+    const strips = displayStripsRef.current
+    if (strips.length <= stripIndex + 1) return
 
     const heights = channelStripHeightsRef.current
-    const upperId = channels[channelIndex].id
+    const resizeChannelId = strips[stripIndex].resizeChannelId
 
     panelHeightBeforeFillRef.current = null
     setPanelFillsWindow(false)
     dragStateRef.current = {
       type: 'channel',
-      channelIndex,
+      channelIndex: stripIndex,
+      resizeChannelId,
       startY: event.clientY,
-      startUpperHeight: getChannelStripHeight(heights, upperId),
+      startUpperHeight: getChannelStripHeight(heights, resizeChannelId),
       startPanelHeight: panelHeightRef.current,
     }
     document.body.classList.add('signal-viewer-dragging')
@@ -3046,21 +3454,21 @@ const SignalViewer = ({ edfData, onBack }) => {
     event.preventDefault()
     event.stopPropagation()
 
-    const channels = activeChannelsRef.current
-    if (channels.length === 0) return
+    const strips = displayStripsRef.current
+    if (strips.length === 0) return
 
-    const lastIndex = channels.length - 1
-    const channelId = channels[lastIndex].id
+    const resizeChannelId = strips[strips.length - 1].resizeChannelId
     const heights = channelStripHeightsRef.current
 
     panelHeightBeforeFillRef.current = null
     setPanelFillsWindow(false)
     dragStateRef.current = {
       type: 'channel',
-      channelIndex: lastIndex,
+      channelIndex: strips.length - 1,
+      resizeChannelId,
       isBottomEdge: true,
       startY: event.clientY,
-      startUpperHeight: getChannelStripHeight(heights, channelId),
+      startUpperHeight: getChannelStripHeight(heights, resizeChannelId),
       startPanelHeight: panelHeightRef.current,
     }
     document.body.classList.add('signal-viewer-dragging')
@@ -3204,7 +3612,31 @@ const SignalViewer = ({ edfData, onBack }) => {
             role="tabpanel"
             hidden={activeTab !== VIEWER_TABS.VIEWER}
           >
-            <div className="signal-display">
+            <div className="signal-viewer-layout">
+              {manipulationIds.length > 0 ? (
+                <aside className="manipulation-drawer" aria-label="Channel tools">
+                  <h3>Channel tools</h3>
+                  <button
+                    type="button"
+                    className={`btn ${compareMode ? 'btn-primary' : 'btn-secondary'}`}
+                    onClick={() => {
+                      setCompareMode((prev) => !prev)
+                      setActiveTab(VIEWER_TABS.VIEWER)
+                    }}
+                  >
+                    {compareMode ? 'Leave compare' : 'Compare'}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-secondary"
+                    onClick={selectionIsOverlayGroup ? revertChannelOverlay : applyChannelOverlay}
+                    disabled={!selectionIsOverlayGroup && manipulationIds.length < 2}
+                  >
+                    {selectionIsOverlayGroup ? 'Revert' : 'Overlay'}
+                  </button>
+                </aside>
+              ) : null}
+              <div className="signal-display">
               <div
                 className="signal-canvas-container"
                 ref={containerRef}
@@ -3251,32 +3683,40 @@ const SignalViewer = ({ edfData, onBack }) => {
                         />
                       </>
                     ) : null}
-                    {channelStripLayouts.map(({ channel, topPercent, heightPercent }) => {
-                      const format = getChannelFormat(channel.id)
-                      const isBinaryMask = format === DEPICTION_FORMATS.BINARY_MASK
-                      const unit = channel.physicalDimension ? ` ${channel.physicalDimension}` : ''
+                    {displayStripLayouts.map(({ strip, topPercent, heightPercent }) => {
+                      const channel = strip.channels[0]
+                      const isOverlay = strip.kind === 'overlay'
+                      const isBinaryMask = !isOverlay && getChannelFormat(channel.id) === DEPICTION_FORMATS.BINARY_MASK
+                      const unit = !isOverlay && channel.physicalDimension ? ` ${channel.physicalDimension}` : ''
                       const formatLabel = isBinaryMask ? ' [mask]' : ''
-                      const labelText = `${channel.label}${unit}${formatLabel}`
+                      const chosen = isOverlay
+                        ? strip.channels.every((member) => manipulationSet.has(member.id))
+                        : manipulationSet.has(channel.id)
+                      const sourceLabel = (member) => (
+                        member.isImported ? `${member.label} (imported)` : member.label
+                      )
+                      const labelText = isOverlay
+                        ? strip.channels.map(sourceLabel).join(' · ')
+                        : `${sourceLabel(channel)}${unit}${formatLabel}`
 
                       return (
                         <div
-                          key={`label-${channel.id}`}
-                          className="channel-strip-label channel-strip-label-reorder"
+                          key={`label-${strip.key}`}
+                          className={`channel-strip-label channel-strip-label-select${chosen ? ' channel-strip-label-chosen' : ''}`}
                           style={{
                             top: `${topPercent}%`,
                             height: `${heightPercent}%`,
                             width: PLOT_PADDING.left,
                           }}
-                          title={
-                            isBinaryMask
-                              ? `${labelText} · drag to reorder`
-                              : `${labelText} · drag to reorder · right-click to set Y-axis range`
-                          }
-                          onPointerDown={(event) => startChannelReorder(event, channel.id)}
+                          title={`${labelText} · click to ${chosen ? 'deselect' : 'select'}`}
+                          onClick={() => toggleManipulation(strip.channels.map((member) => member.id))}
                           onContextMenu={
                             isBinaryMask
                               ? undefined
-                              : (event) => handleChannelYRangeContextMenu(event, channel.id)
+                              : (event) => handleChannelYRangeContextMenu(
+                                event,
+                                isOverlay ? OVERLAY_RANGE_KEY : channel.id
+                              )
                           }
                         >
                           <span className="channel-strip-label-text" title={labelText}>
@@ -3285,21 +3725,27 @@ const SignalViewer = ({ edfData, onBack }) => {
                         </div>
                       )
                     })}
-                    {channelStripLayouts.map(({ channel, topPercent, heightPercent }) => {
-                      const isBinaryMask = getChannelFormat(channel.id) === DEPICTION_FORMATS.BINARY_MASK
-                      const yZoom = channelYZoom[channel.id] ?? DEFAULT_Y_ZOOM
-                      const hasCustomRange = Boolean(channelYRange[channel.id])
-                      const isDragging = reorderingChannelId === channel.id
-                      const isPanning = panningYCenterChannelId === channel.id
+                    {displayStripLayouts.map(({ strip, topPercent, heightPercent }) => {
+                      const channel = strip.channels[0]
+                      const isOverlay = strip.kind === 'overlay'
+                      const isBinaryMask = !isOverlay && getChannelFormat(channel.id) === DEPICTION_FORMATS.BINARY_MASK
+                      const rangeKey = isOverlay ? OVERLAY_RANGE_KEY : channel.id
+                      const yZoom = channelYZoom[rangeKey] ?? DEFAULT_Y_ZOOM
+                      const hasCustomRange = Boolean(channelYRange[rangeKey])
+                      const isDragging = !isOverlay && reorderingChannelId === channel.id
+                      const isPanning = panningYCenterChannelId === rangeKey
+                      const labelText = isOverlay
+                        ? strip.channels.map((member) => member.label).join(', ')
+                        : channel.label
                       const regionTitle = isBinaryMask
-                        ? `Drag ⋮⋮ to reorder ${channel.label}`
-                        : `Drag ⋮⋮ to reorder · scroll to zoom Y-axis${hasCustomRange ? '' : ` (${yZoom.toFixed(1)}x)`} · drag ◆ to shift range · right-click to set range`
+                        ? `Drag ⋮⋮ to reorder ${labelText}`
+                        : `Scroll to zoom Y-axis${hasCustomRange ? '' : ` (${yZoom.toFixed(1)}x)`} · drag ◆ to shift range · right-click to set range`
 
                       return (
                         <div
-                          key={channel.id}
+                          key={strip.key}
                           className={`channel-yzoom-region${isDragging ? ' channel-yzoom-region-dragging' : ''}${isPanning ? ' channel-yzoom-region-panning' : ''}`}
-                          data-channel-id={channel.id}
+                          data-channel-id={rangeKey}
                           style={{
                             top: `${topPercent}%`,
                             height: `${heightPercent}%`,
@@ -3307,34 +3753,38 @@ const SignalViewer = ({ edfData, onBack }) => {
                             width: Y_VALUE_REGION_WIDTH,
                           }}
                           title={regionTitle}
-                          aria-label={`Y-axis controls for ${channel.label}`}
+                          aria-label={`Y-axis controls for ${labelText}`}
                           onContextMenu={
                             isBinaryMask
                               ? undefined
-                              : (event) => handleChannelYRangeContextMenu(event, channel.id)
+                              : (event) => handleChannelYRangeContextMenu(event, rangeKey)
                           }
                         >
-                          <div
-                            className="channel-yzoom-reorder-handle"
-                            title={`Drag to reorder ${channel.label}`}
-                            aria-label={`Reorder ${channel.label}`}
-                            onPointerDown={(event) => startChannelReorder(event, channel.id)}
-                          >
-                            ⋮⋮
-                          </div>
+                          {!isOverlay ? (
+                            <div
+                              className="channel-yzoom-reorder-handle"
+                              title={`Drag to reorder ${labelText}`}
+                              aria-label={`Reorder ${labelText}`}
+                              onPointerDown={(event) => startChannelReorder(event, channel.id)}
+                            >
+                              ⋮⋮
+                            </div>
+                          ) : null}
                           {!isBinaryMask ? (
                             <div
                               className="channel-y-center-handle"
                               style={{ top: '50%' }}
                               title="Drag to shift Y-axis value range"
-                              aria-label={`Shift Y-axis range for ${channel.label}`}
-                              onPointerDown={(event) => startChannelYCenterDrag(event, channel.id)}
+                              aria-label={`Shift Y-axis range for ${labelText}`}
+                              onPointerDown={(event) => startChannelYCenterDrag(event, rangeKey)}
                             />
                           ) : null}
                         </div>
                       )
                     })}
-                    {channelStripLayouts.map(({ channel, topPercent, heightPercent }) => {
+                    {displayStripLayouts.map(({ strip, topPercent, heightPercent }) => {
+                      if (strip.kind === 'overlay') return null
+                      const channel = strip.channels[0]
                       if (getChannelFormat(channel.id) !== DEPICTION_FORMATS.BINARY_MASK) return null
                       if (channel.isAnnotationChannel || channel.isImported) return null
 
@@ -3354,26 +3804,26 @@ const SignalViewer = ({ edfData, onBack }) => {
                         />
                       )
                     })}
-                    {channelBoundaries.map(({ channelIndex, percent }) => (
+                    {displayBoundaries.map(({ stripIndex, percent }) => (
                       <div
-                        key={channelIndex}
+                        key={stripIndex}
                         className="channel-resize-handle"
                         style={{ top: `${percent}%` }}
-                        onPointerDown={(event) => startChannelResize(event, channelIndex)}
+                        onPointerDown={(event) => startChannelResize(event, stripIndex)}
                         role="separator"
                         aria-orientation="horizontal"
-                        aria-label={`Resize ${activeChannels[channelIndex]?.label} height`}
+                        aria-label="Resize channel height"
                       />
                     ))}
-                    {lastChannelBottomPercent !== null ? (
+                    {displayLastBottomPercent !== null ? (
                       <div
                         key="last-channel-bottom"
                         className="channel-resize-handle channel-resize-handle-bottom"
-                        style={{ top: `${lastChannelBottomPercent}%` }}
+                        style={{ top: `${displayLastBottomPercent}%` }}
                         onPointerDown={startLastChannelBottomResize}
                         role="separator"
                         aria-orientation="horizontal"
-                        aria-label={`Resize ${activeChannels[activeChannels.length - 1]?.label} height`}
+                        aria-label="Resize last channel height"
                       />
                     ) : null}
                   </div>
@@ -3421,6 +3871,7 @@ const SignalViewer = ({ edfData, onBack }) => {
                 </span>
               </div>
             </div>
+            </div>
           </div>
 
           <div
@@ -3433,7 +3884,7 @@ const SignalViewer = ({ edfData, onBack }) => {
                 <h3>View Formats</h3>
                 <p className="view-presets-hint">
                   Save all viewer settings to IndexedDB: full sequence channel, channel order, channels,
-                  depiction formats, binary mask overlays, time zoom, panel height, channel strip heights,
+                  depiction formats, overlay groups, binary mask overlays, time zoom, panel height, channel strip heights,
                   Y-axis zoom, Y-axis value ranges, and active tab.
                 </p>
               </div>
