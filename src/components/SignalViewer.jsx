@@ -89,6 +89,7 @@ const MIN_Y_ZOOM = 0.25
 const MAX_Y_ZOOM = 32
 const DEFAULT_Y_ZOOM = 1
 const OVERVIEW_STRIP_HEIGHT = 56
+const CHANNEL_REORDER_DRAG_THRESHOLD = 4
 
 function getDetailChannelsTop() {
   return PLOT_PADDING.top + OVERVIEW_STRIP_HEIGHT
@@ -353,6 +354,15 @@ function reorderArray(array, fromIndex, toIndex) {
   const [item] = next.splice(fromIndex, 1)
   next.splice(toIndex, 0, item)
   return next
+}
+
+function moveChannelBlock(array, memberIds, insertAt) {
+  const memberSet = new Set(memberIds)
+  const members = array.filter((id) => memberSet.has(id))
+  if (members.length === 0) return array
+  const rest = array.filter((id) => !memberSet.has(id))
+  const index = Math.max(0, Math.min(insertAt, rest.length))
+  return [...rest.slice(0, index), ...members, ...rest.slice(index)]
 }
 
 function attachDocumentDragListeners(onMove, onEnd) {
@@ -1244,6 +1254,7 @@ const SignalViewer = ({ edfData, onBack }) => {
 
   const displayStripsRef = useRef(displayStrips)
   const composeModeRef = useRef(composeMode)
+  const overlayMemberIdsRef = useRef(overlayMemberIds)
 
   useEffect(() => {
     displayStripsRef.current = displayStrips
@@ -1252,6 +1263,10 @@ const SignalViewer = ({ edfData, onBack }) => {
   useEffect(() => {
     composeModeRef.current = composeMode
   }, [composeMode])
+
+  useEffect(() => {
+    overlayMemberIdsRef.current = overlayMemberIds
+  }, [overlayMemberIds])
 
   useEffect(() => {
     const visible = new Set(selectedChannels)
@@ -1351,6 +1366,7 @@ const SignalViewer = ({ edfData, onBack }) => {
   const activeChannelsRef = useRef(activeChannels)
   const selectedChannelsRef = useRef(selectedChannels)
   const dragStateRef = useRef(null)
+  const channelLabelPointerRef = useRef(null)
   const onDragMoveRef = useRef(() => {})
   const endDragRef = useRef(() => {})
   const maskEditDragRef = useRef(null)
@@ -3251,7 +3267,7 @@ const SignalViewer = ({ edfData, onBack }) => {
     if (drag.type === 'channel-reorder') {
       const canvas = canvasRef.current
       const strips = displayStripsRef.current
-      if (!canvas || strips.length < 2 || composeModeRef.current === COMPOSE_MODES.OVERLAY) return
+      if (!canvas || strips.length < 2) return
 
       const rect = canvas.getBoundingClientRect()
       if (rect.height <= 0) return
@@ -3268,16 +3284,47 @@ const SignalViewer = ({ edfData, onBack }) => {
         offset += height
       }
 
-      const targetId = strips[targetStripIndex].channels[0].id
-      const fromIndex = selectedChannelsRef.current.indexOf(drag.channelId)
-      const toIndex = selectedChannelsRef.current.indexOf(targetId)
-      if (fromIndex === -1 || toIndex === -1 || fromIndex === toIndex) return
+      const targetStrip = strips[targetStripIndex]
+      if (!targetStrip) return
 
-      const next = reorderArray(selectedChannelsRef.current, fromIndex, toIndex)
-      selectedChannelsRef.current = next
-      activeChannelsRef.current = next
+      const selected = selectedChannelsRef.current
+      let next = selected
+
+      if (drag.channelId === OVERLAY_RANGE_KEY) {
+        const fromStripIndex = strips.findIndex((strip) => strip.kind === 'overlay')
+        if (fromStripIndex === -1 || targetStrip.kind === 'overlay' || fromStripIndex === targetStripIndex) return
+
+        const memberIds = overlayMemberIdsRef.current
+        const memberSet = new Set(memberIds)
+        const rest = selected.filter((id) => !memberSet.has(id))
+        const targetId = targetStrip.channels[0].id
+        const restIndex = rest.indexOf(targetId)
+        if (restIndex === -1) return
+
+        const insertAt = targetStripIndex > fromStripIndex ? restIndex + 1 : restIndex
+        next = moveChannelBlock(selected, memberIds, insertAt)
+      } else {
+        const targetId = targetStrip.channels[0].id
+        const fromIndex = selected.indexOf(drag.channelId)
+        const toIndex = selected.indexOf(targetId)
+        if (fromIndex === -1 || toIndex === -1 || fromIndex === toIndex) return
+        next = reorderArray(selected, fromIndex, toIndex)
+      }
+
+      if (next === selected || next.join(',') === selected.join(',')) return
+
+      const channels = next
         .map((id) => channelByIdRef.current[id])
         .filter(Boolean)
+      selectedChannelsRef.current = next
+      activeChannelsRef.current = channels
+      if (drag.channelId === OVERLAY_RANGE_KEY) {
+        displayStripsRef.current = buildDisplayStrips(
+          channels,
+          overlayMemberIdsRef.current,
+          COMPOSE_MODES.OVERLAY
+        )
+      }
       setSelectedChannels(next)
       return
     }
@@ -3373,25 +3420,93 @@ const SignalViewer = ({ edfData, onBack }) => {
     attachDocumentDragListeners(onDragMoveRef.current, endDragRef.current)
   }, [])
 
-  const startChannelReorder = useCallback((event, channelId) => {
-    if (!isPrimaryPointerButton(event)) return
+  const beginChannelReorder = useCallback((event, channelId, startY = event.clientY) => {
     event.preventDefault()
     event.stopPropagation()
 
-    if (event.currentTarget.setPointerCapture) {
-      event.currentTarget.setPointerCapture(event.pointerId)
+    if (event.currentTarget?.setPointerCapture) {
+      try {
+        event.currentTarget.setPointerCapture(event.pointerId)
+      } catch {
+        // The pointer may already be captured by the channel label.
+      }
     }
 
     dragStateRef.current = {
       type: 'channel-reorder',
       channelId,
-      startY: event.clientY,
+      startY,
     }
     setReorderingChannelId(channelId)
     document.body.classList.add('signal-viewer-dragging')
     document.body.classList.add('signal-viewer-reordering')
     attachDocumentDragListeners(onDragMoveRef.current, endDragRef.current)
   }, [])
+
+  const startChannelReorder = useCallback((event, channelId) => {
+    if (!isPrimaryPointerButton(event)) return
+    beginChannelReorder(event, channelId)
+  }, [beginChannelReorder])
+
+  const handleChannelLabelPointerDown = useCallback((event, strip) => {
+    if (!isPrimaryPointerButton(event)) return
+
+    const channel = strip.channels[0]
+    if (!channel) return
+
+    channelLabelPointerRef.current = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      channelId: strip.kind === 'overlay' ? OVERLAY_RANGE_KEY : channel.id,
+      moved: false,
+    }
+
+    if (event.currentTarget.setPointerCapture) {
+      try {
+        event.currentTarget.setPointerCapture(event.pointerId)
+      } catch {
+        // Ignore when the pointer is no longer active.
+      }
+    }
+  }, [])
+
+  const handleChannelLabelPointerMove = useCallback((event) => {
+    const pointer = channelLabelPointerRef.current
+    if (!pointer || pointer.moved || event.pointerId !== pointer.pointerId) return
+
+    const distance = Math.hypot(event.clientX - pointer.startX, event.clientY - pointer.startY)
+    if (distance < CHANNEL_REORDER_DRAG_THRESHOLD) return
+
+    pointer.moved = true
+    if (pointer.channelId == null) return
+    beginChannelReorder(event, pointer.channelId, pointer.startY)
+  }, [beginChannelReorder])
+
+  const handleChannelLabelPointerUp = useCallback((event) => {
+    const pointer = channelLabelPointerRef.current
+    if (!pointer || event.pointerId !== pointer.pointerId) return
+
+    if (pointer.moved) {
+      window.setTimeout(() => {
+        if (channelLabelPointerRef.current === pointer) {
+          channelLabelPointerRef.current = null
+        }
+      }, 0)
+      return
+    }
+
+    channelLabelPointerRef.current = null
+  }, [])
+
+  const handleChannelLabelClick = useCallback((channelIds) => {
+    const pointer = channelLabelPointerRef.current
+    if (pointer?.moved) {
+      channelLabelPointerRef.current = null
+      return
+    }
+    toggleManipulation(channelIds)
+  }, [toggleManipulation])
 
   const startChannelYCenterDrag = useCallback((event, channelId) => {
     if (!isPrimaryPointerButton(event)) return
@@ -3702,14 +3817,18 @@ const SignalViewer = ({ edfData, onBack }) => {
                       return (
                         <div
                           key={`label-${strip.key}`}
-                          className={`channel-strip-label channel-strip-label-select${chosen ? ' channel-strip-label-chosen' : ''}`}
+                          className={`channel-strip-label channel-strip-label-select channel-strip-label-reorder${chosen ? ' channel-strip-label-chosen' : ''}`}
                           style={{
                             top: `${topPercent}%`,
                             height: `${heightPercent}%`,
                             width: PLOT_PADDING.left,
                           }}
-                          title={`${labelText} · click to ${chosen ? 'deselect' : 'select'}`}
-                          onClick={() => toggleManipulation(strip.channels.map((member) => member.id))}
+                          title={`${labelText} · click to ${chosen ? 'deselect' : 'select'} · drag to reorder`}
+                          onPointerDown={(event) => handleChannelLabelPointerDown(event, strip)}
+                          onPointerMove={handleChannelLabelPointerMove}
+                          onPointerUp={handleChannelLabelPointerUp}
+                          onPointerCancel={handleChannelLabelPointerUp}
+                          onClick={() => handleChannelLabelClick(strip.channels.map((member) => member.id))}
                           onContextMenu={
                             isBinaryMask
                               ? undefined
@@ -3732,14 +3851,14 @@ const SignalViewer = ({ edfData, onBack }) => {
                       const rangeKey = isOverlay ? OVERLAY_RANGE_KEY : channel.id
                       const yZoom = channelYZoom[rangeKey] ?? DEFAULT_Y_ZOOM
                       const hasCustomRange = Boolean(channelYRange[rangeKey])
-                      const isDragging = !isOverlay && reorderingChannelId === channel.id
+                      const isDragging = reorderingChannelId === (isOverlay ? OVERLAY_RANGE_KEY : channel.id)
                       const isPanning = panningYCenterChannelId === rangeKey
                       const labelText = isOverlay
                         ? strip.channels.map((member) => member.label).join(', ')
                         : channel.label
                       const regionTitle = isBinaryMask
                         ? `Drag ⋮⋮ to reorder ${labelText}`
-                        : `Scroll to zoom Y-axis${hasCustomRange ? '' : ` (${yZoom.toFixed(1)}x)`} · drag ◆ to shift range · right-click to set range`
+                        : `Drag ⋮⋮ to reorder · scroll to zoom Y-axis${hasCustomRange ? '' : ` (${yZoom.toFixed(1)}x)`} · drag ◆ to shift range · right-click to set range`
 
                       return (
                         <div
@@ -3760,16 +3879,17 @@ const SignalViewer = ({ edfData, onBack }) => {
                               : (event) => handleChannelYRangeContextMenu(event, rangeKey)
                           }
                         >
-                          {!isOverlay ? (
-                            <div
-                              className="channel-yzoom-reorder-handle"
-                              title={`Drag to reorder ${labelText}`}
-                              aria-label={`Reorder ${labelText}`}
-                              onPointerDown={(event) => startChannelReorder(event, channel.id)}
-                            >
-                              ⋮⋮
-                            </div>
-                          ) : null}
+                          <div
+                            className="channel-yzoom-reorder-handle"
+                            title={`Drag to reorder ${labelText}`}
+                            aria-label={`Reorder ${labelText}`}
+                            onPointerDown={(event) => startChannelReorder(
+                              event,
+                              isOverlay ? OVERLAY_RANGE_KEY : channel.id
+                            )}
+                          >
+                            ⋮⋮
+                          </div>
                           {!isBinaryMask ? (
                             <div
                               className="channel-y-center-handle"

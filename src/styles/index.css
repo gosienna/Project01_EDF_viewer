@@ -1446,6 +1446,12 @@ body.signal-viewer-mask-editing {
   z-index: 2;
 }
 
+.channel-strip-label-select.channel-strip-label-reorder {
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+}
+
 .channel-strip-label-chosen {
   background: rgba(102, 126, 234, 0.18);
 }
