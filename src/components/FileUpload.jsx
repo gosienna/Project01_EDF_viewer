@@ -1,4 +1,4 @@
-import React, { useRef, useEffect, useState, useCallback } from 'react'
+import React, { useRef, useEffect, useState, useCallback, useMemo } from 'react'
 import { buildEdfSummary, deleteEdfRecord, findEdfRecordsByFileName, listEdfRecords, saveEdfRecord } from '../utils/edfStorage'
 import { parseEdfFile } from '../utils/edfParser'
 
@@ -26,12 +26,42 @@ function formatSavedAt(timestamp) {
   return new Date(timestamp).toLocaleString()
 }
 
+function recordSearchText(record) {
+  const summary = record.summary || {}
+  return [
+    record.fileName,
+    summary.patient,
+    summary.recording,
+    summary.startDate,
+    summary.startTime,
+    ...(summary.channelLabels || []),
+    ...(summary.importedChannelLabels || []),
+  ]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase()
+}
+
+function matchesSavedSearch(record, query) {
+  const terms = query.trim().toLowerCase().split(/\s+/).filter(Boolean)
+  if (terms.length === 0) return true
+  const haystack = recordSearchText(record)
+  return terms.every((term) => haystack.includes(term))
+}
+
 const FileUpload = ({ onFileUpload, onLoadSavedEdf, isLoading, error }) => {
   const fileInputRef = useRef(null)
   const [savedRecords, setSavedRecords] = useState([])
+  const [searchQuery, setSearchQuery] = useState('')
   const [isLoadingSaved, setIsLoadingSaved] = useState(true)
   const [savedMessage, setSavedMessage] = useState('')
   const [savedError, setSavedError] = useState('')
+
+  const filteredRecords = useMemo(
+    () => savedRecords.filter((record) => matchesSavedSearch(record, searchQuery)),
+    [savedRecords, searchQuery]
+  )
+  const isSearching = searchQuery.trim().length > 0
 
   const refreshSavedRecords = useCallback(async () => {
     setIsLoadingSaved(true)
@@ -175,13 +205,33 @@ const FileUpload = ({ onFileUpload, onLoadSavedEdf, isLoading, error }) => {
           {savedMessage ? <p className="saved-edf-message">{savedMessage}</p> : null}
           {savedError ? <p className="saved-edf-error">{savedError}</p> : null}
 
+          {!isLoadingSaved && savedRecords.length > 0 ? (
+            <div className="saved-edf-search">
+              <input
+                type="search"
+                className="saved-edf-search-input"
+                value={searchQuery}
+                onChange={(event) => setSearchQuery(event.target.value)}
+                placeholder="Search name, patient, recording, or channel"
+                aria-label="Search saved EDF files"
+              />
+              <p className="saved-edf-search-count">
+                {isSearching
+                  ? `${filteredRecords.length} of ${savedRecords.length}`
+                  : `${savedRecords.length} saved`}
+              </p>
+            </div>
+          ) : null}
+
           {isLoadingSaved ? (
             <p className="saved-edf-empty">Loading saved files...</p>
           ) : savedRecords.length === 0 ? (
             <p className="saved-edf-empty">No saved EDF files yet.</p>
+          ) : filteredRecords.length === 0 ? (
+            <p className="saved-edf-empty">No saved files match “{searchQuery.trim()}”.</p>
           ) : (
             <ul className="saved-edf-list">
-              {savedRecords.map((record) => (
+              {filteredRecords.map((record) => (
                 <li key={record.id} className="saved-edf-item">
                   <div className="saved-edf-info">
                     <span className="saved-edf-name">{record.fileName}</span>
