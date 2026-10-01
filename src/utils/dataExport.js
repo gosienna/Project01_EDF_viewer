@@ -39,6 +39,7 @@ function buildChannelExportPayload(channel, data) {
     transducer: channel.transducer,
     prefiltering: channel.prefiltering,
     isAnnotationChannel: Boolean(channel.isAnnotationChannel),
+    isImported: Boolean(channel.isImported),
     data,
   }
 }
@@ -122,7 +123,7 @@ export function exportEdfData({
     if (physiologicalIds.length === 0) {
       throw new Error('EDF export requires at least one physiological channel')
     }
-    const buffer = buildEdfBuffer(edfData, physiologicalIds, getChannelData)
+    const buffer = buildEdfBuffer(edfData, physiologicalIds, getChannelData, extraChannels)
     downloadBlob(new Blob([buffer], { type: 'application/octet-stream' }), `${baseName}.edf`)
     return
   }

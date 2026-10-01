@@ -26,6 +26,12 @@ export function isAnnotationSignalLabel(label) {
   return normalized === 'EDF Annotations' || normalized === 'BDF Annotations'
 }
 
+function isParquetChannelSource(transducer, reserved) {
+  const reservedValue = String(reserved ?? '').trim().toLowerCase()
+  const transducerValue = String(transducer ?? '').trim().toLowerCase()
+  return reservedValue === 'parquet' || transducerValue === 'parquet import'
+}
+
 function isEdfPlusReserved(reserved) {
   const value = String(reserved ?? '').trim()
   return value.startsWith('EDF+') || value.startsWith('BDF+')
@@ -127,22 +133,30 @@ export async function parseEdfFile(source) {
   const digitalMaxs = readFieldBlock(128, 8).map((v) => parseInt(v, 10) || 0)
   const prefilterings = readFieldBlock(136, 80)
   const samplesPerRecord = readFieldBlock(216, 8).map((v) => parseInt(v, 10) || 0)
+  const reservedFields = readFieldBlock(224, 32)
 
-  const allSignals = labels.map((label, index) => ({
-    id: index,
-    label,
-    transducer: transducers[index],
-    physicalDimension: physicalDimensions[index],
-    physicalMin: physicalMins[index],
-    physicalMax: physicalMaxs[index],
-    digitalMin: digitalMins[index],
-    digitalMax: digitalMaxs[index],
-    prefiltering: prefilterings[index],
-    samplesPerRecord: samplesPerRecord[index],
-    sampleRate: header.duration > 0 ? samplesPerRecord[index] / header.duration : 0,
-    isAnnotationSignal: isAnnotationSignalLabel(label),
-    data: [],
-  }))
+  const allSignals = labels.map((label, index) => {
+    const transducer = transducers[index]
+    const reserved = reservedFields[index]
+    const isImported = isParquetChannelSource(transducer, reserved)
+    return {
+      id: index,
+      label,
+      transducer,
+      physicalDimension: physicalDimensions[index],
+      physicalMin: physicalMins[index],
+      physicalMax: physicalMaxs[index],
+      digitalMin: digitalMins[index],
+      digitalMax: digitalMaxs[index],
+      prefiltering: prefilterings[index],
+      samplesPerRecord: samplesPerRecord[index],
+      sampleRate: header.duration > 0 ? samplesPerRecord[index] / header.duration : 0,
+      isAnnotationSignal: isAnnotationSignalLabel(label),
+      isImported,
+      source: isImported ? 'parquet' : 'edf',
+      data: [],
+    }
+  })
 
   const expectedDataBytes = allSignals.reduce(
     (sum, channel) => sum + header.numRecords * channel.samplesPerRecord * 2,
