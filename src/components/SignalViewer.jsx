@@ -1431,6 +1431,7 @@ const SignalViewer = ({ edfData, onBack }) => {
   )
   const [activeTab, setActiveTab] = useState(VIEWER_TABS.VIEWER)
   const [importedChannels, setImportedChannels] = useState([])
+  const [removedPersistedChannelIds, setRemovedPersistedChannelIds] = useState([])
   const [importSampleRate, setImportSampleRate] = useState('')
   const [importError, setImportError] = useState('')
   const nextImportedIdRef = useRef(PARQUET_CHANNEL_ID_BASE)
@@ -1478,9 +1479,14 @@ const SignalViewer = ({ edfData, onBack }) => {
     [edfData.annotations, totalDuration, annotationGroups]
   )
 
+  const visibleFileChannels = useMemo(
+    () => edfData.channels.filter((channel) => !removedPersistedChannelIds.includes(channel.id)),
+    [edfData.channels, removedPersistedChannelIds]
+  )
+
   const allChannels = useMemo(
-    () => [...edfData.channels, ...annotationChannels, ...importedChannels],
-    [edfData.channels, annotationChannels, importedChannels]
+    () => [...visibleFileChannels, ...annotationChannels, ...importedChannels],
+    [visibleFileChannels, annotationChannels, importedChannels]
   )
 
   const channelById = useMemo(
@@ -1511,9 +1517,9 @@ const SignalViewer = ({ edfData, onBack }) => {
     const selectedOrdered = selectedChannels
       .map((id) => channelById[id])
       .filter((ch) => ch && !ch.isAnnotationChannel && !ch.isImported)
-    const unselected = edfData.channels.filter((ch) => !selectedSet.has(ch.id) && !ch.isImported)
+    const unselected = visibleFileChannels.filter((ch) => !selectedSet.has(ch.id) && !ch.isImported)
     return [...selectedOrdered, ...unselected]
-  }, [edfData.channels, selectedChannels, channelById])
+  }, [visibleFileChannels, selectedChannels, channelById])
 
   const annotationItemsForList = useMemo(() => {
     const items = displayAnnotationGroups.map((group, groupIndex) => {
@@ -1540,7 +1546,7 @@ const SignalViewer = ({ edfData, onBack }) => {
 
   const importedChannelsForList = useMemo(() => {
     const selectedSet = new Set(selectedChannels)
-    const persistedImported = edfData.channels.filter((channel) => channel.isImported)
+    const persistedImported = visibleFileChannels.filter((channel) => channel.isImported)
     const sessionIds = new Set(importedChannels.map((channel) => channel.id))
     const selectedOrdered = selectedChannels
       .map((id) => channelById[id])
@@ -1550,7 +1556,7 @@ const SignalViewer = ({ edfData, onBack }) => {
       ...importedChannels.filter((channel) => !selectedSet.has(channel.id)),
     ]
     return [...selectedOrdered, ...unselected]
-  }, [edfData.channels, importedChannels, selectedChannels, channelById])
+  }, [visibleFileChannels, importedChannels, selectedChannels, channelById])
 
   const canvasHeight = useMemo(
     () => getCanvasHeightForPanel(panelHeight),
@@ -1847,6 +1853,7 @@ const SignalViewer = ({ edfData, onBack }) => {
 
   useEffect(() => {
     setImportedChannels([])
+    setRemovedPersistedChannelIds([])
     setImportError('')
     setSelectedChannels((prev) => {
       if (!prev.some((id) => id >= PARQUET_CHANNEL_ID_BASE)) return prev
@@ -2350,21 +2357,22 @@ const SignalViewer = ({ edfData, onBack }) => {
     const getData = (channelId) => getMaskData(channelId)
     const hasMaskEdits = Object.keys(maskOverridesRef.current).length > 0
     const hasImported = importedChannels.length > 0
+    const hasRemovedPersisted = removedPersistedChannelIds.length > 0
 
-    if (!hasMaskEdits && !hasImported && edfData.rawBuffer) {
+    if (!hasMaskEdits && !hasImported && !hasRemovedPersisted && edfData.rawBuffer) {
       return edfData.rawBuffer
     }
 
     return buildEdfBuffer(
       edfData,
       [
-        ...edfData.channels.map((channel) => channel.id),
+        ...visibleFileChannels.map((channel) => channel.id),
         ...importedChannels.map((channel) => channel.id),
       ],
       getData,
       importedChannels
     )
-  }, [edfData, getMaskData, importedChannels])
+  }, [edfData, getMaskData, importedChannels, removedPersistedChannelIds, visibleFileChannels])
 
   const performSaveEdf = useCallback(async ({ replaceRecordIds = [], saveAsNew = false } = {}) => {
     setEdfSaveError('')
@@ -2373,7 +2381,7 @@ const SignalViewer = ({ edfData, onBack }) => {
     const mergedBuffer = buildMergedEdfBuffer()
     const summary = buildEdfSummary({
       ...edfData,
-      channels: [...edfData.channels, ...importedChannels],
+      channels: [...visibleFileChannels, ...importedChannels],
     })
     const fileName = edfData.fileName
 
@@ -2399,7 +2407,7 @@ const SignalViewer = ({ edfData, onBack }) => {
         : `Saved "${fileName}" to IndexedDB`
     )
     return id
-  }, [edfData, importedChannels, buildMergedEdfBuffer, persistAllMaskOverrides])
+  }, [edfData, importedChannels, visibleFileChannels, buildMergedEdfBuffer, persistAllMaskOverrides])
 
   const resolveSaveEdfPromise = useCallback((error = null) => {
     const resolvers = saveEdfResolversRef.current
@@ -2461,6 +2469,7 @@ const SignalViewer = ({ edfData, onBack }) => {
       !edfData.rawBuffer
       && Object.keys(maskOverridesRef.current).length === 0
       && importedChannels.length === 0
+      && removedPersistedChannelIds.length === 0
     ) {
       const error = new Error('No raw file data available to save')
       setEdfSaveError(error.message)
@@ -2489,8 +2498,11 @@ const SignalViewer = ({ edfData, onBack }) => {
   }
 
   const hasPendingExportChanges = useMemo(
-    () => Object.keys(maskOverrides).length > 0 || !savedRecordId || importedChannels.length > 0,
-    [maskOverrides, savedRecordId, importedChannels]
+    () => Object.keys(maskOverrides).length > 0
+      || !savedRecordId
+      || importedChannels.length > 0
+      || removedPersistedChannelIds.length > 0,
+    [maskOverrides, savedRecordId, importedChannels, removedPersistedChannelIds]
   )
 
   useEffect(() => {
@@ -3018,8 +3030,15 @@ const SignalViewer = ({ edfData, onBack }) => {
     }
   }
 
-  const handleRemoveImportedChannel = (channelId) => {
+  const signalChannelCount = visibleFileChannels.length + importedChannels.length
+
+  const handleRemoveChannel = (channelId) => {
+    if (signalChannelCount <= 1) return
     setImportedChannels((prev) => prev.filter((channel) => channel.id !== channelId))
+    setRemovedPersistedChannelIds((prev) => {
+      if (!edfData.channels.some((channel) => channel.id === channelId)) return prev
+      return prev.includes(channelId) ? prev : [...prev, channelId]
+    })
     setSelectedChannels((prev) => prev.filter((id) => id !== channelId))
     setChannelFormats((prev) => {
       if (!(channelId in prev)) return prev
@@ -3034,6 +3053,18 @@ const SignalViewer = ({ edfData, onBack }) => {
         next[id] = targets.filter((targetId) => targetId !== channelId)
       })
       return next
+    })
+    setMaskOverrides((prev) => {
+      if (!(channelId in prev)) return prev
+      const next = { ...prev }
+      delete next[channelId]
+      return next
+    })
+    setOverviewChannelId((prev) => {
+      if (prev !== channelId) return prev
+      const remaining = allChannels.filter((channel) => channel.id !== channelId)
+      const preferred = selectedChannels.filter((id) => id !== channelId)
+      return getDefaultOverviewChannelId(remaining, preferred)
     })
   }
 
@@ -3206,13 +3237,15 @@ const SignalViewer = ({ edfData, onBack }) => {
 
     return (
       <div key={channel.id} className="channel-item">
-        <label className="channel-item-header">
-          <input
-            type="checkbox"
-            checked={selectedChannels.includes(channel.id)}
-            onChange={() => handleChannelToggle(channel.id)}
-          />
-          <span className="channel-label">{channel.label}</span>
+        <div className="channel-item-header">
+          <label className="channel-item-select">
+            <input
+              type="checkbox"
+              checked={selectedChannels.includes(channel.id)}
+              onChange={() => handleChannelToggle(channel.id)}
+            />
+            <span className="channel-label">{channel.label}</span>
+          </label>
           {maskColor ? (
             <span
               className="binary-mask-color-swatch"
@@ -3220,7 +3253,20 @@ const SignalViewer = ({ edfData, onBack }) => {
               title="Binary mask color"
             />
           ) : null}
-        </label>
+          <button
+            type="button"
+            className="btn btn-small btn-secondary channel-item-remove"
+            onClick={() => handleRemoveChannel(channel.id)}
+            disabled={signalChannelCount <= 1}
+            title={
+              signalChannelCount <= 1
+                ? 'The recording needs at least one signal channel'
+                : 'Remove this channel from the recording (Save EDF to keep the change)'
+            }
+          >
+            Remove
+          </button>
+        </div>
         <span className="channel-meta">
           {channel.sampleRate.toFixed(1)} Hz
           {channel.physicalDimension ? ` · ${channel.physicalDimension}` : ''}
@@ -4163,7 +4209,7 @@ const SignalViewer = ({ edfData, onBack }) => {
         <div>
           <h2>Signal Viewer</h2>
           <p className="viewer-meta">
-            {edfData.fileName} ·             {edfData.channels.length} channels
+            {edfData.fileName} · {visibleFileChannels.length} channels
             {annotationChannels.length > 0 ? ` · ${annotationChannels.length} annotation` : ''}
             {importedChannels.length > 0 ? ` · ${importedChannels.length} imported` : ''}
             {' · '}
@@ -4837,7 +4883,7 @@ const SignalViewer = ({ edfData, onBack }) => {
                       <button
                         type="button"
                         className="btn btn-secondary btn-small"
-                        onClick={() => handleRemoveImportedChannel(channel.id)}
+                        onClick={() => handleRemoveChannel(channel.id)}
                       >
                         Remove
                       </button>

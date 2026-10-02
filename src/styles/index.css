@@ -596,6 +596,21 @@ body {
   margin-left: auto;
 }
 
+.channel-item .channel-item-remove,
+.channel-item .channel-depiction-select {
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.15s ease;
+}
+
+.channel-item:hover .channel-item-remove,
+.channel-item:focus-within .channel-item-remove,
+.channel-item:hover .channel-depiction-select,
+.channel-item:focus-within .channel-depiction-select {
+  opacity: 1;
+  visibility: visible;
+}
+
 .channel-item--annotation .channel-item-header {
   align-items: center;
   cursor: default;
@@ -713,6 +728,14 @@ body {
   display: flex;
   align-items: flex-start;
   gap: 0.5rem;
+}
+
+.channel-item-select {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  flex: 1;
+  min-width: 0;
   cursor: pointer;
 }
 
