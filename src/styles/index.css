@@ -1520,6 +1520,7 @@ body.signal-viewer-mask-editing {
   transform: translateY(-50%);
   cursor: ns-resize;
   z-index: 2;
+  box-sizing: border-box;
 }
 
 .channel-yzoom-region {
@@ -1628,6 +1629,42 @@ body.signal-viewer-mask-editing {
 
 .channel-strip-label-reorder:active {
   cursor: grabbing;
+}
+
+.channel-label-resize-handle {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 10px;
+  transform: translateX(-50%);
+  cursor: ew-resize;
+  z-index: 9;
+  touch-action: none;
+  pointer-events: auto;
+}
+
+.channel-label-resize-handle::after {
+  content: '';
+  position: absolute;
+  top: 12%;
+  bottom: 12%;
+  left: 50%;
+  width: 2px;
+  transform: translateX(-50%);
+  border-radius: 999px;
+  background: transparent;
+  transition: background 0.15s ease;
+}
+
+.channel-label-resize-handle:hover::after,
+.channel-label-resize-handle:active::after,
+body.signal-viewer-label-resizing .channel-label-resize-handle::after {
+  background: rgba(102, 126, 234, 0.7);
+}
+
+body.signal-viewer-label-resizing {
+  cursor: ew-resize;
+  user-select: none;
 }
 
 .channel-strip-label-interactive {

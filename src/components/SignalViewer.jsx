@@ -123,6 +123,9 @@ const VIEWER_TAB_ITEMS = [
 ]
 
 const PLOT_PADDING = { top: 20, right: 20, bottom: 30, left: 70 }
+const DEFAULT_CHANNEL_LABEL_WIDTH = PLOT_PADDING.left
+const MIN_CHANNEL_LABEL_WIDTH = 48
+const MAX_CHANNEL_LABEL_WIDTH = 280
 const MIN_WINDOW_SECONDS = 5
 const WHEEL_ZOOM_BASE = 1.15
 const DEFAULT_CHANNEL_STRIP_HEIGHT = 80
@@ -231,16 +234,16 @@ function isActiveBinary(value) {
   return value > 0.5
 }
 
-function clientXToTime(clientX, canvas, viewStart, viewEnd) {
+function clientXToTime(clientX, canvas, viewStart, viewEnd, plotLeft = PLOT_PADDING.left) {
   const rect = canvas.getBoundingClientRect()
   if (rect.width <= 0) return viewStart
 
   const scaleX = canvas.width / rect.width
   const mouseX = (clientX - rect.left) * scaleX
-  const plotWidth = canvas.width - PLOT_PADDING.left - PLOT_PADDING.right
+  const plotWidth = canvas.width - plotLeft - PLOT_PADDING.right
   if (plotWidth <= 0) return viewStart
 
-  const fraction = Math.max(0, Math.min(1, (mouseX - PLOT_PADDING.left) / plotWidth))
+  const fraction = Math.max(0, Math.min(1, (mouseX - plotLeft) / plotWidth))
   return viewStart + fraction * (viewEnd - viewStart)
 }
 
@@ -868,13 +871,14 @@ function withMarkerPercents(rows, canvasHeight) {
 
 function buildHoverReadout(pointer, context, overviewRangeCache) {
   const { canvasX, canvasY, canvasWidth, canvasHeight } = pointer
-  const plotWidth = canvasWidth - PLOT_PADDING.left - PLOT_PADDING.right
-  const plotLeft = PLOT_PADDING.left + Y_VALUE_REGION_WIDTH
+  const labelWidth = context.plotLeft ?? PLOT_PADDING.left
+  const plotWidth = canvasWidth - labelWidth - PLOT_PADDING.right
+  const plotLeft = labelWidth + Y_VALUE_REGION_WIDTH
   const plotRight = canvasWidth - PLOT_PADDING.right
   if (plotWidth <= 0 || canvasHeight <= 0) return null
   if (canvasX < plotLeft || canvasX > plotRight) return null
 
-  const fraction = Math.max(0, Math.min(1, (canvasX - PLOT_PADDING.left) / plotWidth))
+  const fraction = Math.max(0, Math.min(1, (canvasX - labelWidth) / plotWidth))
   const {
     viewStart,
     viewEnd,
@@ -1163,7 +1167,8 @@ function downsampleRange(data, startIndex, endIndex, targetPoints) {
   const length = end - start
   if (length <= 0) return []
 
-  const points = Math.min(targetPoints, length)
+  const points = Math.max(0, Math.min(Math.floor(targetPoints) || 0, length))
+  if (points <= 0) return []
   const result = new Array(points)
 
   for (let i = 0; i < points; i += 1) {
@@ -1510,6 +1515,7 @@ const SignalViewer = ({ edfData, onBack }) => {
   const [canvasSize, setCanvasSize] = useState({ width: 0, height: 400 })
   const [panelHeight, setPanelHeight] = useState(DEFAULT_PANEL_HEIGHT)
   const [panelFillsWindow, setPanelFillsWindow] = useState(false)
+  const [channelLabelWidth, setChannelLabelWidth] = useState(DEFAULT_CHANNEL_LABEL_WIDTH)
   const [manipulationIds, setManipulationIds] = useState([])
   const [temporaryChannelIds, setTemporaryChannelIds] = useState(null)
   const [overlayGroups, setOverlayGroups] = useState([])
@@ -1651,6 +1657,11 @@ const SignalViewer = ({ edfData, onBack }) => {
     ]
     return [...selectedOrdered, ...unselected]
   }, [visibleFileChannels, importedChannels, selectedChannels, channelById])
+
+  const pendingImportFileCount = useMemo(
+    () => new Set(pendingImportColumns.map((column) => column.fileName)).size,
+    [pendingImportColumns]
+  )
 
   const canvasHeight = useMemo(
     () => getCanvasHeightForPanel(panelHeight),
@@ -1914,6 +1925,7 @@ const SignalViewer = ({ edfData, onBack }) => {
 
   const panelHeightRef = useRef(panelHeight)
   const panelHeightBeforeFillRef = useRef(null)
+  const channelLabelWidthRef = useRef(channelLabelWidth)
   const channelStripHeightsRef = useRef(channelStripHeights)
   const channelYZoomRef = useRef(channelYZoom)
   const channelYRangeRef = useRef(channelYRange)
@@ -1936,6 +1948,10 @@ const SignalViewer = ({ edfData, onBack }) => {
   useEffect(() => {
     panelHeightRef.current = panelHeight
   }, [panelHeight])
+
+  useEffect(() => {
+    channelLabelWidthRef.current = channelLabelWidth
+  }, [channelLabelWidth])
 
   useEffect(() => {
     channelStripHeightsRef.current = channelStripHeights
@@ -2309,9 +2325,21 @@ const SignalViewer = ({ edfData, onBack }) => {
   ])
 
   const getChannelPlotWidth = useCallback(
-    () => Math.max(canvasSize.width - PLOT_PADDING.left - PLOT_PADDING.right, 1),
-    [canvasSize.width]
+    () => Math.max(canvasSize.width - channelLabelWidth - PLOT_PADDING.right, 1),
+    [canvasSize.width, channelLabelWidth]
   )
+
+  useEffect(() => {
+    if (canvasSize.width <= 0) return
+    const maxForPlot = Math.max(
+      MIN_CHANNEL_LABEL_WIDTH,
+      canvasSize.width - PLOT_PADDING.right - Y_VALUE_REGION_WIDTH - 80
+    )
+    const maxAllowed = Math.min(MAX_CHANNEL_LABEL_WIDTH, maxForPlot)
+    if (channelLabelWidthRef.current <= maxAllowed) return
+    channelLabelWidthRef.current = maxAllowed
+    setChannelLabelWidth(maxAllowed)
+  }, [canvasSize.width])
 
   const readChannelDisplayRange = useCallback((channelId) => {
     if (isOverlayRangeKey(channelId)) {
@@ -2681,8 +2709,8 @@ const SignalViewer = ({ edfData, onBack }) => {
     const ctx = canvas.getContext('2d')
     const width = canvas.width
     const height = canvas.height
-    const padding = PLOT_PADDING
-    const plotWidth = width - padding.left - padding.right
+    const padding = { ...PLOT_PADDING, left: channelLabelWidth }
+    const plotWidth = Math.max(width - padding.left - padding.right, 1)
 
     ctx.clearRect(0, 0, width, height)
     ctx.fillStyle = '#ffffff'
@@ -2805,6 +2833,9 @@ const SignalViewer = ({ edfData, onBack }) => {
 
       clipToChannelStrip(ctx, padding.left, plotWidth, yTop, stripHeight)
 
+      const overlayMemberIds = new Set(strip.channels.map((member) => member.id))
+      const sequenceMemberIds = new Set(sequenceMembers.map((member) => member.id))
+
       strip.channels.forEach((member) => {
         if (getChannelFormat(member.id) !== DEPICTION_FORMATS.BINARY_MASK) return
         const segments = getBinaryMaskSegments(
@@ -2824,6 +2855,22 @@ const SignalViewer = ({ edfData, onBack }) => {
           yBottom - 2,
           color,
           null
+        )
+      })
+
+      // Keep binary-mask "Overlay on" targets visible after channels are composed.
+      binaryMaskSegmentsByChannel.forEach(({ channel: maskChannel, segments, color, overlayTargets }) => {
+        if (overlayMemberIds.has(maskChannel.id)) return
+        if (!overlayTargets?.some((targetId) => sequenceMemberIds.has(targetId))) return
+        drawBinaryMaskSegments(
+          ctx,
+          segments,
+          padding.left,
+          plotWidth,
+          yTop + 2,
+          yBottom - 2,
+          color?.fill,
+          color?.stroke
         )
       })
 
@@ -2890,7 +2937,7 @@ const SignalViewer = ({ edfData, onBack }) => {
           return
         }
 
-        if (!overlayTargets.includes(channel.id)) {
+        if (!overlayTargets?.includes(channel.id)) {
           return
         }
 
@@ -2901,8 +2948,8 @@ const SignalViewer = ({ edfData, onBack }) => {
           plotWidth,
           yTop + 2,
           yBottom - 2,
-          color.fill,
-          color.stroke
+          color?.fill,
+          color?.stroke
         )
       })
 
@@ -3020,7 +3067,7 @@ const SignalViewer = ({ edfData, onBack }) => {
       width / 2,
       height - 20
     )
-  }, [edfData, displayStrips, drawnChannels, drawnChannelIds.length, temporaryChannelIds, manipulationSet, channelById, channelFormats, layoutStripHeights, channelYZoom, channelYRange, overviewChannel, drawnBinaryMaskChannels, getChannelFormat, getBinaryMaskOverlayTargets, getMaskData, maskSelection, viewStart, viewEnd, windowSeconds, totalDuration, canvasSize.width, canvasSize.height])
+  }, [edfData, displayStrips, drawnChannels, drawnChannelIds.length, temporaryChannelIds, manipulationSet, channelById, channelFormats, layoutStripHeights, channelYZoom, channelYRange, overviewChannel, drawnBinaryMaskChannels, getChannelFormat, getBinaryMaskOverlayTargets, getMaskData, maskSelection, viewStart, viewEnd, windowSeconds, totalDuration, canvasSize.width, canvasSize.height, channelLabelWidth])
 
   useEffect(() => {
     if (canvasSize.width > 0) {
@@ -3106,6 +3153,7 @@ const SignalViewer = ({ edfData, onBack }) => {
 
   const handleImportParquetFiles = async (event) => {
     const fileList = [...(event.target.files ?? [])]
+      .sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }))
     event.target.value = ''
     if (fileList.length === 0) return
 
@@ -3113,6 +3161,7 @@ const SignalViewer = ({ edfData, onBack }) => {
     setIsLoadingParquet(true)
     const errors = []
     const staged = []
+    let filesRead = 0
 
     for (const file of fileList) {
       if (!file.name.toLowerCase().endsWith('.parquet')) {
@@ -3135,6 +3184,7 @@ const SignalViewer = ({ edfData, onBack }) => {
             included: true,
           })
         })
+        filesRead += 1
       } catch (error) {
         errors.push(error.message || `Failed to read "${file.name}"`)
       }
@@ -3144,7 +3194,10 @@ const SignalViewer = ({ edfData, onBack }) => {
       setPendingImportColumns((prev) => [...prev, ...staged])
     }
     if (errors.length > 0) {
-      setImportError(errors.join(' '))
+      const summary = filesRead > 0
+        ? `Loaded ${filesRead} file${filesRead === 1 ? '' : 's'} (${staged.length} column${staged.length === 1 ? '' : 's'}). `
+        : ''
+      setImportError(`${summary}${errors.join(' ')}`)
     }
     setIsLoadingParquet(false)
   }
@@ -3741,7 +3794,7 @@ const SignalViewer = ({ edfData, onBack }) => {
     if (!canvas || !channel) return
 
     const { viewStart: vs, viewEnd: ve } = viewRangeRef.current
-    const time = clientXToTime(event.clientX, canvas, vs, ve)
+    const time = clientXToTime(event.clientX, canvas, vs, ve, channelLabelWidthRef.current)
     const sampleIndex = timeToSampleIndex(time, channel.sampleRate, drag.dataLength)
 
     maskEditDragRef.current = { ...drag, endSample: sampleIndex }
@@ -3764,7 +3817,7 @@ const SignalViewer = ({ edfData, onBack }) => {
 
     const data = maskOverridesRef.current[channelId] ?? channel.data
     const { viewStart: vs, viewEnd: ve } = viewRangeRef.current
-    const time = clientXToTime(event.clientX, canvas, vs, ve)
+    const time = clientXToTime(event.clientX, canvas, vs, ve, channelLabelWidthRef.current)
     const sampleIndex = timeToSampleIndex(time, channel.sampleRate, data.length)
 
     if (isActiveBinary(data[sampleIndex])) {
@@ -3811,10 +3864,11 @@ const SignalViewer = ({ edfData, onBack }) => {
 
     const scaleX = canvas.width / rect.width
     const mouseX = (clientX - rect.left) * scaleX
-    const plotWidth = canvas.width - PLOT_PADDING.left - PLOT_PADDING.right
+    const labelWidth = channelLabelWidthRef.current
+    const plotWidth = canvas.width - labelWidth - PLOT_PADDING.right
     if (plotWidth <= 0) return
 
-    const fraction = Math.max(0, Math.min(1, (mouseX - PLOT_PADDING.left) / plotWidth))
+    const fraction = Math.max(0, Math.min(1, (mouseX - labelWidth) / plotWidth))
     const time = fraction * totalDuration
     setViewStart(clampViewStart(time - windowSeconds / 2, windowSeconds, totalDuration))
   }, [totalDuration, windowSeconds])
@@ -3832,10 +3886,11 @@ const SignalViewer = ({ edfData, onBack }) => {
 
     const scaleX = canvas.width / rect.width
     const mouseX = (event.clientX - rect.left) * scaleX
-    const plotWidth = canvas.width - PLOT_PADDING.left - PLOT_PADDING.right
+    const labelWidth = channelLabelWidthRef.current
+    const plotWidth = canvas.width - labelWidth - PLOT_PADDING.right
     if (plotWidth <= 0) return
 
-    const fraction = Math.max(0, Math.min(1, (mouseX - PLOT_PADDING.left) / plotWidth))
+    const fraction = Math.max(0, Math.min(1, (mouseX - labelWidth) / plotWidth))
     const timeAtMouse = fraction * totalDuration
     const zoomFactor = WHEEL_ZOOM_BASE ** (-event.deltaY / 100)
     const newWindowSeconds = Math.max(
@@ -3930,6 +3985,7 @@ const SignalViewer = ({ edfData, onBack }) => {
     document.body.classList.remove('signal-viewer-dragging')
     document.body.classList.remove('signal-viewer-reordering')
     document.body.classList.remove('signal-viewer-y-panning')
+    document.body.classList.remove('signal-viewer-label-resizing')
     detachDocumentDragListeners(onDragMoveRef.current, endDragRef.current)
     if (wasReordering) {
       setReorderingChannelId(null)
@@ -3958,6 +4014,29 @@ const SignalViewer = ({ edfData, onBack }) => {
           targetPlotHeight
         )
       )
+      return
+    }
+
+    if (drag.type === 'label-width') {
+      const canvas = canvasRef.current
+      if (!canvas) return
+
+      const rect = canvas.getBoundingClientRect()
+      if (rect.width <= 0) return
+
+      const scaleX = canvas.width / rect.width
+      const deltaCanvas = (event.clientX - drag.startX) * scaleX
+      const maxForPlot = Math.max(
+        MIN_CHANNEL_LABEL_WIDTH,
+        canvas.width - PLOT_PADDING.right - Y_VALUE_REGION_WIDTH - 80
+      )
+      const nextWidth = Math.max(
+        MIN_CHANNEL_LABEL_WIDTH,
+        Math.min(MAX_CHANNEL_LABEL_WIDTH, maxForPlot, drag.startWidth + deltaCanvas)
+      )
+      if (nextWidth === channelLabelWidthRef.current) return
+      channelLabelWidthRef.current = nextWidth
+      setChannelLabelWidth(nextWidth)
       return
     }
 
@@ -4165,6 +4244,21 @@ const SignalViewer = ({ edfData, onBack }) => {
     attachDocumentDragListeners(onDragMoveRef.current, endDragRef.current)
   }, [])
 
+  const startLabelWidthResize = useCallback((event) => {
+    if (!isPrimaryPointerButton(event)) return
+    event.preventDefault()
+    event.stopPropagation()
+
+    dragStateRef.current = {
+      type: 'label-width',
+      startX: event.clientX,
+      startWidth: channelLabelWidthRef.current,
+    }
+    document.body.classList.add('signal-viewer-dragging')
+    document.body.classList.add('signal-viewer-label-resizing')
+    attachDocumentDragListeners(onDragMoveRef.current, endDragRef.current)
+  }, [])
+
   const beginChannelReorder = useCallback((event, channelId, startY = event.clientY) => {
     event.preventDefault()
     event.stopPropagation()
@@ -4342,6 +4436,7 @@ const SignalViewer = ({ edfData, onBack }) => {
       document.body.classList.remove('signal-viewer-dragging')
       document.body.classList.remove('signal-viewer-reordering')
       document.body.classList.remove('signal-viewer-y-panning')
+      document.body.classList.remove('signal-viewer-label-resizing')
       document.body.classList.remove('signal-viewer-mask-editing')
     }
   }, [])
@@ -4360,10 +4455,11 @@ const SignalViewer = ({ edfData, onBack }) => {
       const scaleY = canvas.height / rect.height
       const mouseX = (event.clientX - rect.left) * scaleX
       const mouseY = (event.clientY - rect.top) * scaleY
-      const plotWidth = canvas.width - PLOT_PADDING.left - PLOT_PADDING.right
+      const labelWidth = channelLabelWidthRef.current
+      const plotWidth = canvas.width - labelWidth - PLOT_PADDING.right
       if (plotWidth <= 0) return
 
-      const fraction = Math.max(0, Math.min(1, (mouseX - PLOT_PADDING.left) / plotWidth))
+      const fraction = Math.max(0, Math.min(1, (mouseX - labelWidth) / plotWidth))
       const inOverview = mouseY >= PLOT_PADDING.top && mouseY < getDetailChannelsTop()
       const timeAtMouse = inOverview
         ? fraction * totalDuration
@@ -4418,6 +4514,7 @@ const SignalViewer = ({ edfData, onBack }) => {
     getMaskData,
     readDisplayRange: readChannelDisplayRange,
     colorChannels: drawnChannels,
+    plotLeft: channelLabelWidth,
   }
 
   return (
@@ -4552,7 +4649,7 @@ const SignalViewer = ({ edfData, onBack }) => {
                           style={{
                             top: `${overviewStripLayout.topPercent}%`,
                             height: `${overviewStripLayout.heightPercent}%`,
-                            width: PLOT_PADDING.left,
+                            width: channelLabelWidth,
                           }}
                         >
                           <span
@@ -4568,7 +4665,7 @@ const SignalViewer = ({ edfData, onBack }) => {
                           style={{
                             top: `${overviewStripLayout.topPercent}%`,
                             height: `${overviewStripLayout.heightPercent}%`,
-                            left: PLOT_PADDING.left,
+                            left: channelLabelWidth,
                             right: PLOT_PADDING.right,
                           }}
                           onClick={handleOverviewClick}
@@ -4600,7 +4697,7 @@ const SignalViewer = ({ edfData, onBack }) => {
                           style={{
                             top: `${topPercent}%`,
                             height: `${heightPercent}%`,
-                            width: PLOT_PADDING.left,
+                            width: channelLabelWidth,
                           }}
                           title={`${labelText} · click to ${chosen ? 'deselect' : 'select'} · drag to reorder`}
                           onPointerDown={(event) => handleChannelLabelPointerDown(event, strip)}
@@ -4623,6 +4720,15 @@ const SignalViewer = ({ edfData, onBack }) => {
                         </div>
                       )
                     })}
+                    <div
+                      className="channel-label-resize-handle"
+                      style={{ left: channelLabelWidth }}
+                      onPointerDown={startLabelWidthResize}
+                      role="separator"
+                      aria-orientation="vertical"
+                      aria-label="Resize channel name width"
+                      title="Drag to expand or shrink channel name width"
+                    />
                     {displayStripLayouts.map(({ strip, topPercent, heightPercent }) => {
                       const channel = strip.channels[0]
                       const isOverlay = strip.kind === 'overlay'
@@ -4647,7 +4753,7 @@ const SignalViewer = ({ edfData, onBack }) => {
                           style={{
                             top: `${topPercent}%`,
                             height: `${heightPercent}%`,
-                            left: PLOT_PADDING.left,
+                            left: channelLabelWidth,
                             width: Y_VALUE_REGION_WIDTH,
                           }}
                           title={regionTitle}
@@ -4694,7 +4800,7 @@ const SignalViewer = ({ edfData, onBack }) => {
                           style={{
                             top: `${topPercent}%`,
                             height: `${heightPercent}%`,
-                            left: PLOT_PADDING.left + Y_VALUE_REGION_WIDTH,
+                            left: channelLabelWidth + Y_VALUE_REGION_WIDTH,
                             right: PLOT_PADDING.right,
                           }}
                           onMouseDown={(event) => handleBinaryMaskMouseDown(event, channel.id)}
@@ -4707,7 +4813,7 @@ const SignalViewer = ({ edfData, onBack }) => {
                       <div
                         key={stripIndex}
                         className="channel-resize-handle"
-                        style={{ top: `${percent}%` }}
+                        style={{ top: `${percent}%`, left: channelLabelWidth }}
                         onPointerDown={(event) => startChannelResize(event, stripIndex)}
                         role="separator"
                         aria-orientation="horizontal"
@@ -4718,7 +4824,7 @@ const SignalViewer = ({ edfData, onBack }) => {
                       <div
                         key="last-channel-bottom"
                         className="channel-resize-handle channel-resize-handle-bottom"
-                        style={{ top: `${displayLastBottomPercent}%` }}
+                        style={{ top: `${displayLastBottomPercent}%`, left: channelLabelWidth }}
                         onPointerDown={startLastChannelBottomResize}
                         role="separator"
                         aria-orientation="horizontal"
@@ -4960,7 +5066,7 @@ const SignalViewer = ({ edfData, onBack }) => {
                 <div className="channel-list">
                   {importedChannelsForList.length === 0 ? (
                     <p className="channel-section-empty">
-                      No parquet series imported. Use Import Data to add one.
+                      No parquet series imported. Use Import Data to add files.
                     </p>
                   ) : (
                     importedChannelsForList.map((channel) => renderChannelSelectItem(channel))
@@ -5048,9 +5154,11 @@ const SignalViewer = ({ edfData, onBack }) => {
               <div className="parquet-import-header">
                 <h3>Import Data</h3>
                 <p className="parquet-import-hint">
-                  Load numeric Parquet columns onto this recording. Sample 0 shares time zero
-                  with the EDF. After choosing files, set a sample rate for each column.
-                  Filename rates (for example 2hz) and the override below pre-fill those fields.
+                  Select one or many Parquet files in a single pick (for example
+                  channel_a.parquet and channel_b.parquet). Sample 0 shares time zero
+                  with the EDF. After choosing files, set a sample rate for each column,
+                  then import them together. Filename rates (for example 2hz) and the
+                  override below pre-fill those fields.
                 </p>
               </div>
 
@@ -5077,7 +5185,7 @@ const SignalViewer = ({ edfData, onBack }) => {
                   Apply to selected
                 </button>
                 <label className="btn btn-primary parquet-import-file">
-                  {isLoadingParquet ? 'Reading…' : 'Choose Parquet'}
+                  {isLoadingParquet ? 'Reading files…' : 'Choose Parquet files'}
                   <input
                     type="file"
                     accept=".parquet,application/vnd.apache.parquet"
@@ -5093,7 +5201,17 @@ const SignalViewer = ({ edfData, onBack }) => {
               {pendingImportColumns.length > 0 ? (
                 <div className="parquet-import-pending">
                   <div className="parquet-import-pending-header">
-                    <h4>Pending columns</h4>
+                    <h4>
+                      Pending
+                      {' '}
+                      {pendingImportColumns.length}
+                      {' '}
+                      column{pendingImportColumns.length === 1 ? '' : 's'}
+                      {' from '}
+                      {pendingImportFileCount}
+                      {' '}
+                      file{pendingImportFileCount === 1 ? '' : 's'}
+                    </h4>
                     <div className="parquet-import-pending-actions">
                       <button
                         type="button"
