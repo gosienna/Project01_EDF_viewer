@@ -14,9 +14,10 @@ import { buildEdfBuffer } from '../utils/edfWriter'
 import {
   PARQUET_CHANNEL_ID_BASE,
   buildImportedChannel,
+  defaultImportSampleRateText,
   importChannelLabel,
+  parseSampleRateText,
   readParquetNumericColumns,
-  resolveImportSampleRate,
   uniqueChannelLabel,
 } from '../utils/parquetImport'
 import ChannelYRangeDialog from './ChannelYRangeDialog'
@@ -51,8 +52,53 @@ const COMPOSE_MODES = {
   OVERLAY: 'overlay',
 }
 
-const OVERLAY_RANGE_KEY = 'overlay'
+const OVERLAY_RANGE_PREFIX = 'overlay:'
+const LEGACY_OVERLAY_RANGE_KEY = 'overlay'
 const OVERLAY_LINE_ALPHA = 0.55
+
+function getOverlayRangeKey(memberIds) {
+  return `${OVERLAY_RANGE_PREFIX}${[...memberIds].sort((a, b) => a - b).join(',')}`
+}
+
+function isOverlayRangeKey(key) {
+  return typeof key === 'string'
+    && (key === LEGACY_OVERLAY_RANGE_KEY || key.startsWith(OVERLAY_RANGE_PREFIX))
+}
+
+function sanitizeOverlayGroups(groups) {
+  const seen = new Set()
+  const next = []
+  ;(groups ?? []).forEach((group) => {
+    const members = []
+    ;(group ?? []).forEach((id) => {
+      const channelId = Number(id)
+      if (!Number.isFinite(channelId) || seen.has(channelId)) return
+      seen.add(channelId)
+      members.push(channelId)
+    })
+    if (members.length >= 2) next.push(members)
+  })
+  return next
+}
+
+function findMatchingOverlayGroupIndex(groups, selectedIds) {
+  if (!selectedIds || selectedIds.length < 2) return -1
+  const selectedSet = new Set(selectedIds.map(Number))
+  return (groups ?? []).findIndex((group) => (
+    group.length === selectedSet.size && group.every((id) => selectedSet.has(id))
+  ))
+}
+
+function overlayGroupsEqual(a, b) {
+  if (a === b) return true
+  if (!a || !b || a.length !== b.length) return false
+  return a.every((group, index) => {
+    const other = b[index]
+    return other
+      && group.length === other.length
+      && group.every((id, memberIndex) => id === other[memberIndex])
+  })
+}
 const SELECTION_HIGHLIGHT = 'rgba(102, 126, 234, 0.16)'
 
 const DEPICTION_OPTIONS = [
@@ -614,7 +660,7 @@ function hexToRgba(hex, alpha) {
   return `rgba(${r}, ${g}, ${b}, ${alpha})`
 }
 
-function buildDisplayStrips(channels, manipulationIds, composeMode) {
+function buildDisplayStrips(channels, overlayGroups) {
   const asChannelStrip = (channel) => ({
     kind: 'channel',
     key: String(channel.id),
@@ -622,36 +668,47 @@ function buildDisplayStrips(channels, manipulationIds, composeMode) {
     resizeChannelId: channel.id,
   })
 
-  if (composeMode !== COMPOSE_MODES.OVERLAY || manipulationIds.length === 0) {
+  const visibleIds = new Set(channels.map((channel) => channel.id))
+  const groups = sanitizeOverlayGroups(
+    (overlayGroups ?? []).map((group) => group.filter((id) => visibleIds.has(id)))
+  )
+  if (groups.length === 0) {
     return channels.map(asChannelStrip)
   }
 
-  const selected = new Set(manipulationIds)
-  const members = []
-  let placed = false
+  const groupIndexByChannelId = new Map()
+  groups.forEach((group, groupIndex) => {
+    group.forEach((id) => groupIndexByChannelId.set(id, groupIndex))
+  })
+
+  const placedGroups = new Set()
   const strips = []
 
   channels.forEach((channel) => {
-    if (!selected.has(channel.id)) {
+    const groupIndex = groupIndexByChannelId.get(channel.id)
+    if (groupIndex === undefined) {
       strips.push(asChannelStrip(channel))
       return
     }
-    members.push(channel)
-    if (!placed) {
-      strips.push(null)
-      placed = true
+    if (placedGroups.has(groupIndex)) return
+    placedGroups.add(groupIndex)
+
+    const memberIds = new Set(groups[groupIndex])
+    const members = channels.filter((item) => memberIds.has(item.id))
+    if (members.length < 2) {
+      members.forEach((member) => strips.push(asChannelStrip(member)))
+      return
     }
+
+    strips.push({
+      kind: 'overlay',
+      key: getOverlayRangeKey(members.map((member) => member.id)),
+      channels: members,
+      resizeChannelId: members[members.length - 1].id,
+    })
   })
 
-  if (members.length < 2) return channels.map(asChannelStrip)
-
-  const group = {
-    kind: 'overlay',
-    key: OVERLAY_RANGE_KEY,
-    channels: members,
-    resizeChannelId: members[members.length - 1].id,
-  }
-  return strips.map((strip) => strip ?? group)
+  return strips
 }
 
 function getDisplayStripHeight(strip, channelStripHeights) {
@@ -896,7 +953,7 @@ function buildHoverReadout(pointer, context, overviewRangeCache) {
       return describeChannelValue(member, time, {
         isBinary,
         data: getMaskData(member.id),
-        display: isBinary ? null : readDisplayRange(OVERLAY_RANGE_KEY),
+        display: isBinary ? null : readDisplayRange(strip.key),
         yTop,
         yBottom,
         stripHeight: height,
@@ -1142,6 +1199,44 @@ function normalizeChannelLabelRecord(record) {
   )
 }
 
+function normalizeOverlayChannelGroups(groups, legacyLabels, composeMode) {
+  if (Array.isArray(groups) && groups.length > 0) {
+    return groups
+      .map((group) => [...(group ?? [])].filter(Boolean).sort((a, b) => a.localeCompare(b)))
+      .filter((group) => group.length >= 2)
+      .sort((a, b) => a.join('\0').localeCompare(b.join('\0')))
+  }
+
+  if (composeMode === COMPOSE_MODES.OVERLAY) {
+    const legacy = [...(legacyLabels ?? [])].filter(Boolean).sort((a, b) => a.localeCompare(b))
+    return legacy.length >= 2 ? [legacy] : []
+  }
+
+  return []
+}
+
+function resolveOverlayGroupsFromParams(params, labelToId) {
+  if (Array.isArray(params.overlayChannelGroups) && params.overlayChannelGroups.length > 0) {
+    return sanitizeOverlayGroups(
+      params.overlayChannelGroups.map((group) => (
+        (group ?? [])
+          .map((label) => labelToId[label])
+          .filter((id) => id !== undefined)
+      ))
+    )
+  }
+
+  if (params.composeMode === COMPOSE_MODES.OVERLAY) {
+    return sanitizeOverlayGroups([[
+      ...(params.overlayChannelLabels ?? [])
+        .map((label) => labelToId[label])
+        .filter((id) => id !== undefined),
+    ]])
+  }
+
+  return []
+}
+
 function buildViewParams({
   edfData,
   selectedChannels,
@@ -1157,8 +1252,7 @@ function buildViewParams({
   activeTab,
   annotationGroups,
   allChannels,
-  overlayMemberIds,
-  composeMode,
+  overlayGroups,
 }) {
   const channelById = Object.fromEntries(
     (allChannels ?? [...edfData.channels]).map((ch) => [ch.id, ch])
@@ -1184,6 +1278,10 @@ function buildViewParams({
 
   const uniqueLabels = getUniqueAnnotationLabels(edfData.annotations ?? [])
   const normalizedGroups = normalizeAnnotationGroups(annotationGroups, uniqueLabels)
+  const overlayChannelGroups = sanitizeOverlayGroups(overlayGroups)
+    .map((group) => group.map((id) => channelById[id]?.label).filter(Boolean))
+    .filter((group) => group.length >= 2)
+  const primaryOverlayLabels = overlayChannelGroups[0] ?? []
 
   return {
     selectedChannelLabels,
@@ -1199,10 +1297,10 @@ function buildViewParams({
     viewStart,
     panelHeight,
     activeTab,
-    overlayChannelLabels: (overlayMemberIds ?? [])
-      .map((id) => channelById[id]?.label)
-      .filter(Boolean),
-    composeMode: composeMode === COMPOSE_MODES.OVERLAY ? COMPOSE_MODES.OVERLAY : COMPOSE_MODES.BACKDROP,
+    overlayChannelGroups,
+    // Legacy single-group fields kept for older preset readers.
+    overlayChannelLabels: primaryOverlayLabels,
+    composeMode: overlayChannelGroups.length > 0 ? COMPOSE_MODES.OVERLAY : COMPOSE_MODES.BACKDROP,
   }
 }
 
@@ -1232,10 +1330,11 @@ function normalizeViewParams(params) {
     viewStart: params.viewStart,
     panelHeight: params.panelHeight ?? DEFAULT_PANEL_HEIGHT,
     activeTab: resolveActiveTab(params),
-    overlayChannelLabels: [...(params.overlayChannelLabels ?? [])],
-    composeMode: params.composeMode === COMPOSE_MODES.OVERLAY
-      ? COMPOSE_MODES.OVERLAY
-      : COMPOSE_MODES.BACKDROP,
+    overlayChannelGroups: normalizeOverlayChannelGroups(
+      params.overlayChannelGroups,
+      params.overlayChannelLabels,
+      params.composeMode
+    ),
   }
 }
 
@@ -1256,8 +1355,7 @@ function resolveFullViewParams(params, edfData, totalDuration) {
     activeTab: applied.activeTab,
     annotationGroups: applied.annotationGroups,
     allChannels: applied.allChannels,
-    overlayMemberIds: applied.overlayMemberIds,
-    composeMode: applied.composeMode,
+    overlayGroups: applied.overlayGroups,
   })
 }
 
@@ -1355,12 +1453,7 @@ function applyViewParams(params, edfData, totalDuration) {
     overviewChannelId = getDefaultOverviewChannelId(allChannels, selectedChannelsResult)
   }
 
-  const overlayMemberIds = (params.overlayChannelLabels ?? [])
-    .map((label) => labelToId[label])
-    .filter((id) => id !== undefined)
-  const composeMode = params.composeMode === COMPOSE_MODES.OVERLAY && overlayMemberIds.length >= 2
-    ? COMPOSE_MODES.OVERLAY
-    : COMPOSE_MODES.BACKDROP
+  const overlayGroups = resolveOverlayGroupsFromParams(params, labelToId)
 
   Object.entries(formats).forEach(([id, format]) => {
     if (format !== DEPICTION_FORMATS.BINARY_MASK) return
@@ -1388,8 +1481,7 @@ function applyViewParams(params, edfData, totalDuration) {
     activeTab: resolveActiveTab(params),
     annotationGroups: groups,
     allChannels,
-    overlayMemberIds,
-    composeMode,
+    overlayGroups,
   }
 }
 
@@ -1420,9 +1512,8 @@ const SignalViewer = ({ edfData, onBack }) => {
   const [panelFillsWindow, setPanelFillsWindow] = useState(false)
   const [manipulationIds, setManipulationIds] = useState([])
   const [temporaryChannelIds, setTemporaryChannelIds] = useState(null)
-  const [overlayMemberIds, setOverlayMemberIds] = useState([])
+  const [overlayGroups, setOverlayGroups] = useState([])
   const [compareMode, setCompareMode] = useState(false)
-  const [composeMode, setComposeMode] = useState(COMPOSE_MODES.BACKDROP)
   const [channelStripHeights, setChannelStripHeights] = useState({})
   const [channelYZoom, setChannelYZoom] = useState({})
   const [channelYRange, setChannelYRange] = useState({})
@@ -1433,8 +1524,11 @@ const SignalViewer = ({ edfData, onBack }) => {
   const [importedChannels, setImportedChannels] = useState([])
   const [removedPersistedChannelIds, setRemovedPersistedChannelIds] = useState([])
   const [importSampleRate, setImportSampleRate] = useState('')
+  const [pendingImportColumns, setPendingImportColumns] = useState([])
   const [importError, setImportError] = useState('')
+  const [isLoadingParquet, setIsLoadingParquet] = useState(false)
   const nextImportedIdRef = useRef(PARQUET_CHANNEL_ID_BASE)
+  const pendingImportKeyRef = useRef(0)
   const [savedPresets, setSavedPresets] = useState([])
   const [presetName, setPresetName] = useState('')
   const [presetMessage, setPresetMessage] = useState('')
@@ -1569,12 +1663,14 @@ const SignalViewer = ({ edfData, onBack }) => {
   )
 
   const displayStrips = useMemo(
-    () => buildDisplayStrips(drawnChannels, overlayMemberIds, composeMode),
-    [drawnChannels, overlayMemberIds, composeMode]
+    () => buildDisplayStrips(drawnChannels, overlayGroups),
+    [drawnChannels, overlayGroups]
   )
 
   const compareChannels = useMemo(() => {
-    const sourceIds = manipulationIds.length > 0 ? manipulationIds : overlayMemberIds
+    const sourceIds = manipulationIds.length > 0
+      ? manipulationIds
+      : overlayGroups.flat()
     return sourceIds.map((id) => {
       const channel = channelById[id]
       if (!channel) return null
@@ -1588,7 +1684,12 @@ const SignalViewer = ({ edfData, onBack }) => {
         color: CHANNEL_COLORS[colorIndex % CHANNEL_COLORS.length],
       }
     }).filter(Boolean)
-  }, [manipulationIds, overlayMemberIds, channelById, drawnChannels, channelFormats, maskOverrides])
+  }, [manipulationIds, overlayGroups, channelById, drawnChannels, channelFormats, maskOverrides])
+
+  const compareShareScale = useMemo(() => {
+    const ids = compareChannels.map((channel) => channel.id)
+    return findMatchingOverlayGroupIndex(overlayGroups, ids) >= 0
+  }, [compareChannels, overlayGroups])
 
   const layoutStripHeights = useMemo(() => {
     if (temporaryChannelIds === null) return channelStripHeights
@@ -1660,29 +1761,40 @@ const SignalViewer = ({ edfData, onBack }) => {
   }, [overviewChannelId, channelById, allChannels, selectedChannels])
 
   const displayStripsRef = useRef(displayStrips)
-  const composeModeRef = useRef(composeMode)
-  const overlayMemberIdsRef = useRef(overlayMemberIds)
+  const overlayGroupsRef = useRef(overlayGroups)
 
   useEffect(() => {
     displayStripsRef.current = displayStrips
   }, [displayStrips])
 
   useEffect(() => {
-    composeModeRef.current = composeMode
-  }, [composeMode])
-
-  useEffect(() => {
-    overlayMemberIdsRef.current = overlayMemberIds
-  }, [overlayMemberIds])
+    overlayGroupsRef.current = overlayGroups
+  }, [overlayGroups])
 
   useEffect(() => {
     const visible = new Set(selectedChannels)
-    setOverlayMemberIds((prev) => {
-      const next = prev.filter((id) => visible.has(id))
-      if (next.length < 2) return prev.length === 0 ? prev : []
-      return next.length === prev.length ? prev : next
+    setOverlayGroups((prev) => {
+      const next = sanitizeOverlayGroups(prev.map((group) => group.filter((id) => visible.has(id))))
+      return overlayGroupsEqual(prev, next) ? prev : next
     })
   }, [selectedChannels])
+
+  useEffect(() => {
+    const validKeys = new Set(overlayGroups.map((group) => getOverlayRangeKey(group)))
+    const pruneOverlayKeys = (prev) => {
+      let changed = false
+      const next = { ...prev }
+      Object.keys(next).forEach((key) => {
+        if (isOverlayRangeKey(key) && !validKeys.has(key)) {
+          delete next[key]
+          changed = true
+        }
+      })
+      return changed ? next : prev
+    }
+    setChannelYZoom(pruneOverlayKeys)
+    setChannelYRange(pruneOverlayKeys)
+  }, [overlayGroups])
 
   const selectedChannelKey = selectedChannels.join(',')
 
@@ -1697,12 +1809,6 @@ const SignalViewer = ({ edfData, onBack }) => {
       return next.length === prev.length ? prev : next
     })
   }, [temporaryChannelIds, selectedChannels])
-
-  useEffect(() => {
-    if (overlayMemberIds.length < 2 && composeMode === COMPOSE_MODES.OVERLAY) {
-      setComposeMode(COMPOSE_MODES.BACKDROP)
-    }
-  }, [overlayMemberIds, composeMode])
 
   const previousAllChannelsRef = useRef(allChannels)
 
@@ -1750,11 +1856,31 @@ const SignalViewer = ({ edfData, onBack }) => {
       return next
     })
 
-    const remapIdRecord = (prev) => {
+    const remapIdRecord = (prev, { allowOverlayKeys = false } = {}) => {
       const entries = Object.entries(prev)
-      if (entries.every(([id]) => nextIds.has(Number(id)))) return prev
+      const needsRemap = entries.some(([id]) => {
+        if (allowOverlayKeys && isOverlayRangeKey(id)) {
+          if (id === LEGACY_OVERLAY_RANGE_KEY) return true
+          const memberIds = id.slice(OVERLAY_RANGE_PREFIX.length).split(',').map(Number)
+          return memberIds.some((memberId) => !nextIds.has(memberId))
+        }
+        return !nextIds.has(Number(id))
+      })
+      if (!needsRemap) return prev
+
       const next = {}
       entries.forEach(([id, value]) => {
+        if (allowOverlayKeys && isOverlayRangeKey(id)) {
+          if (id === LEGACY_OVERLAY_RANGE_KEY) return
+          const memberIds = id.slice(OVERLAY_RANGE_PREFIX.length).split(',').map(Number)
+          const remapped = memberIds.map((memberId) => {
+            const label = labelOf(previous, memberId)
+            return label ? idForLabel(allChannels, label) : undefined
+          })
+          if (remapped.some((memberId) => memberId === undefined)) return
+          next[getOverlayRangeKey(remapped)] = value
+          return
+        }
         const label = labelOf(previous, id)
         const nextId = label ? idForLabel(allChannels, label) : undefined
         if (nextId !== undefined) next[nextId] = value
@@ -1763,8 +1889,19 @@ const SignalViewer = ({ edfData, onBack }) => {
     }
 
     setChannelStripHeights((prev) => remapIdRecord(prev))
-    setChannelYZoom((prev) => remapIdRecord(prev))
-    setChannelYRange((prev) => remapIdRecord(prev))
+    setChannelYZoom((prev) => remapIdRecord(prev, { allowOverlayKeys: true }))
+    setChannelYRange((prev) => remapIdRecord(prev, { allowOverlayKeys: true }))
+
+    setOverlayGroups((prev) => {
+      const next = sanitizeOverlayGroups(
+        prev.map((group) => group.map((id) => {
+          if (nextIds.has(id)) return id
+          const label = labelOf(previous, id)
+          return label ? idForLabel(allChannels, label) : undefined
+        }).filter((id) => id !== undefined))
+      )
+      return overlayGroupsEqual(prev, next) ? prev : next
+    })
 
     setOverviewChannelId((prev) => {
       if (nextIds.has(prev)) return prev
@@ -2073,8 +2210,7 @@ const SignalViewer = ({ edfData, onBack }) => {
     setWindowSeconds(next.windowSeconds)
     setViewStart(next.viewStart)
     setPanelHeight(next.panelHeight)
-    setOverlayMemberIds(next.overlayMemberIds)
-    setComposeMode(next.composeMode)
+    setOverlayGroups(next.overlayGroups)
     setTemporaryChannelIds(null)
     setLoadedPresetId(preset.id)
     setActiveTab(next.activeTab)
@@ -2123,8 +2259,7 @@ const SignalViewer = ({ edfData, onBack }) => {
         activeTab,
         annotationGroups,
         allChannels,
-        overlayMemberIds,
-        composeMode,
+        overlayGroups,
       }),
     [
       edfData,
@@ -2141,8 +2276,7 @@ const SignalViewer = ({ edfData, onBack }) => {
       activeTab,
       annotationGroups,
       allChannels,
-      overlayMemberIds,
-      composeMode,
+      overlayGroups,
     ]
   )
 
@@ -2171,6 +2305,7 @@ const SignalViewer = ({ edfData, onBack }) => {
     panelHeight,
     activeTab,
     annotationGroups,
+    overlayGroups,
   ])
 
   const getChannelPlotWidth = useCallback(
@@ -2179,8 +2314,10 @@ const SignalViewer = ({ edfData, onBack }) => {
   )
 
   const readChannelDisplayRange = useCallback((channelId) => {
-    if (channelId === OVERLAY_RANGE_KEY) {
-      const group = displayStripsRef.current.find((strip) => strip.kind === 'overlay')
+    if (isOverlayRangeKey(channelId)) {
+      const group = displayStripsRef.current.find(
+        (strip) => strip.kind === 'overlay' && strip.key === channelId
+      )
       if (!group) return null
       const sequenceMembers = group.channels.filter(
         (member) => getChannelFormat(member.id) !== DEPICTION_FORMATS.BINARY_MASK
@@ -2206,7 +2343,7 @@ const SignalViewer = ({ edfData, onBack }) => {
         minVal = 0
         maxVal = 1
       }
-      const override = channelYRangeRef.current[OVERLAY_RANGE_KEY]
+      const override = channelYRangeRef.current[channelId]
       if (
         override
         && Number.isFinite(override.min)
@@ -2219,7 +2356,7 @@ const SignalViewer = ({ edfData, onBack }) => {
           displayRange: override.max - override.min,
         }
       }
-      const yZoom = channelYZoomRef.current[OVERLAY_RANGE_KEY] ?? DEFAULT_Y_ZOOM
+      const yZoom = channelYZoomRef.current[channelId] ?? DEFAULT_Y_ZOOM
       return getVisibleValueRange(minVal, maxVal, yZoom)
     }
 
@@ -2237,16 +2374,18 @@ const SignalViewer = ({ edfData, onBack }) => {
   }, [channelById, getChannelPlotWidth, getChannelFormat, getMaskData])
 
   const openYRangeDialog = useCallback((channelId) => {
-    if (channelId !== OVERLAY_RANGE_KEY && getChannelFormat(channelId) === DEPICTION_FORMATS.BINARY_MASK) return
+    if (!isOverlayRangeKey(channelId) && getChannelFormat(channelId) === DEPICTION_FORMATS.BINARY_MASK) return
 
     const display = readChannelDisplayRange(channelId)
     if (!display) return
 
     const channel = channelById[channelId]
-    const group = displayStripsRef.current.find((strip) => strip.kind === 'overlay')
+    const group = displayStripsRef.current.find(
+      (strip) => strip.kind === 'overlay' && strip.key === channelId
+    )
     setYRangeDialog({
       channelId,
-      channelLabel: channelId === OVERLAY_RANGE_KEY
+      channelLabel: isOverlayRangeKey(channelId)
         ? (group?.channels.map((member) => member.label).join(', ') || 'Overlay')
         : channel?.label ?? '',
       min: display.displayMin,
@@ -2287,7 +2426,7 @@ const SignalViewer = ({ edfData, onBack }) => {
   }, [yRangeDialog])
 
   const handleChannelYRangeContextMenu = useCallback((event, channelId) => {
-    if (channelId !== OVERLAY_RANGE_KEY && getChannelFormat(channelId) === DEPICTION_FORMATS.BINARY_MASK) return
+    if (!isOverlayRangeKey(channelId) && getChannelFormat(channelId) === DEPICTION_FORMATS.BINARY_MASK) return
     event.preventDefault()
     event.stopPropagation()
     openYRangeDialog(channelId)
@@ -2615,6 +2754,7 @@ const SignalViewer = ({ edfData, onBack }) => {
     }
 
     const drawOverlayStrip = (strip, yTop, yBottom, stripHeight) => {
+      const rangeKey = strip.key
       const sequenceMembers = strip.channels.filter(
         (member) => getChannelFormat(member.id) !== DEPICTION_FORMATS.BINARY_MASK
       )
@@ -2636,12 +2776,12 @@ const SignalViewer = ({ edfData, onBack }) => {
         return { member, samples }
       })
 
-      const override = channelYRange[OVERLAY_RANGE_KEY]
+      const override = channelYRange[rangeKey]
       const hasCustomRange = override
         && Number.isFinite(override.min)
         && Number.isFinite(override.max)
         && override.min < override.max
-      const yZoom = channelYZoom[OVERLAY_RANGE_KEY] ?? DEFAULT_Y_ZOOM
+      const yZoom = channelYZoom[rangeKey] ?? DEFAULT_Y_ZOOM
       let displayMin = 0
       let displayMax = 1
       let displayRange = 1
@@ -2888,22 +3028,29 @@ const SignalViewer = ({ edfData, onBack }) => {
     }
   }, [drawSignals, canvasSize])
 
-  const selectionIsOverlayGroup = overlayMemberIds.length > 1
-    && manipulationIds.length === overlayMemberIds.length
-    && overlayMemberIds.every((id) => manipulationIds.includes(id))
+  const selectionIsOverlayGroup = findMatchingOverlayGroupIndex(
+    overlayGroups,
+    manipulationIds
+  ) >= 0
 
   const applyChannelOverlay = useCallback(() => {
     if (manipulationIds.length < 2) return
-    setOverlayMemberIds([...manipulationIds])
-    setComposeMode(COMPOSE_MODES.OVERLAY)
+    const selected = new Set(manipulationIds)
+    setOverlayGroups((prev) => {
+      const remaining = prev
+        .map((group) => group.filter((id) => !selected.has(id)))
+        .filter((group) => group.length >= 2)
+      return sanitizeOverlayGroups([...remaining, [...manipulationIds]])
+    })
     setManipulationIds([])
   }, [manipulationIds])
 
   const revertChannelOverlay = useCallback(() => {
-    setComposeMode(COMPOSE_MODES.BACKDROP)
-    setOverlayMemberIds([])
+    const groupIndex = findMatchingOverlayGroupIndex(overlayGroups, manipulationIds)
+    if (groupIndex < 0) return
+    setOverlayGroups((prev) => prev.filter((_, index) => index !== groupIndex))
     setManipulationIds([])
-  }, [])
+  }, [overlayGroups, manipulationIds])
 
   const toggleManipulation = useCallback((channelIds) => {
     setManipulationIds((prev) => {
@@ -2963,9 +3110,9 @@ const SignalViewer = ({ edfData, onBack }) => {
     if (fileList.length === 0) return
 
     setImportError('')
+    setIsLoadingParquet(true)
     const errors = []
-    const created = []
-    const usedLabels = new Set(allChannels.map((channel) => channel.label))
+    const staged = []
 
     for (const file of fileList) {
       if (!file.name.toLowerCase().endsWith('.parquet')) {
@@ -2974,60 +3121,132 @@ const SignalViewer = ({ edfData, onBack }) => {
       }
 
       try {
-        const sampleRate = resolveImportSampleRate(file.name, importSampleRate)
         const columns = await readParquetNumericColumns(await file.arrayBuffer())
+        const sampleRateText = defaultImportSampleRateText(file.name, importSampleRate)
         columns.forEach((column) => {
-          const label = uniqueChannelLabel(
-            importChannelLabel(file.name, column.name, columns.length),
-            usedLabels
-          )
-          const id = nextImportedIdRef.current
-          nextImportedIdRef.current += 1
-          created.push(buildImportedChannel({
-            id,
-            label,
+          pendingImportKeyRef.current += 1
+          staged.push({
+            key: pendingImportKeyRef.current,
+            fileName: file.name,
+            columnName: column.name,
+            label: importChannelLabel(file.name, column.name, columns.length),
             data: column.data,
-            sampleRate,
-            sourceFileName: file.name,
-          }))
+            sampleRateText,
+            included: true,
+          })
         })
       } catch (error) {
-        errors.push(error.message || `Failed to import "${file.name}"`)
+        errors.push(error.message || `Failed to read "${file.name}"`)
       }
     }
 
-    if (created.length > 0) {
-      const binaryIds = created
-        .filter((channel) => isBinarySignal(channel.data))
-        .map((channel) => channel.id)
-
-      setImportedChannels((prev) => [...prev, ...created])
-      setSelectedChannels((prev) => [...prev, ...created.map((channel) => channel.id)])
-      if (binaryIds.length > 0) {
-        setChannelFormats((prev) => {
-          const next = { ...prev }
-          binaryIds.forEach((id) => {
-            next[id] = DEPICTION_FORMATS.BINARY_MASK
-          })
-          return next
-        })
-        setBinaryMaskOverlays((prev) => {
-          const next = { ...prev }
-          const nextFormats = { ...channelFormats }
-          binaryIds.forEach((id) => {
-            nextFormats[id] = DEPICTION_FORMATS.BINARY_MASK
-          })
-          binaryIds.forEach((id) => {
-            next[id] = getDefaultBinaryMaskOverlayTargets(id, selectedChannels, nextFormats)
-          })
-          return next
-        })
-      }
+    if (staged.length > 0) {
+      setPendingImportColumns((prev) => [...prev, ...staged])
     }
-
     if (errors.length > 0) {
       setImportError(errors.join(' '))
     }
+    setIsLoadingParquet(false)
+  }
+
+  const handlePendingSampleRateChange = (key, value) => {
+    setPendingImportColumns((prev) => prev.map((column) => (
+      column.key === key ? { ...column, sampleRateText: value } : column
+    )))
+  }
+
+  const handlePendingIncludedChange = (key, included) => {
+    setPendingImportColumns((prev) => prev.map((column) => (
+      column.key === key ? { ...column, included } : column
+    )))
+  }
+
+  const handleApplyDefaultRateToPending = () => {
+    const rateText = String(importSampleRate ?? '').trim()
+    if (!rateText) {
+      setImportError('Enter a sample rate override before applying it to pending columns.')
+      return
+    }
+    try {
+      parseSampleRateText(rateText)
+    } catch (error) {
+      setImportError(error.message || 'Sample rate must be a positive number')
+      return
+    }
+    setImportError('')
+    setPendingImportColumns((prev) => prev.map((column) => (
+      column.included ? { ...column, sampleRateText: rateText } : column
+    )))
+  }
+
+  const handleClearPendingImport = () => {
+    setPendingImportColumns([])
+    setImportError('')
+  }
+
+  const handleConfirmPendingImport = () => {
+    const selected = pendingImportColumns.filter((column) => column.included)
+    if (selected.length === 0) {
+      setImportError('Select at least one column to import.')
+      return
+    }
+
+    const errors = []
+    const created = []
+    const usedLabels = new Set(allChannels.map((channel) => channel.label))
+
+    selected.forEach((column) => {
+      try {
+        const sampleRate = parseSampleRateText(column.sampleRateText)
+        const label = uniqueChannelLabel(column.label, usedLabels)
+        const id = nextImportedIdRef.current
+        nextImportedIdRef.current += 1
+        created.push(buildImportedChannel({
+          id,
+          label,
+          data: column.data,
+          sampleRate,
+          sourceFileName: column.fileName,
+        }))
+      } catch {
+        errors.push(`"${column.label}" needs a positive sample rate.`)
+      }
+    })
+
+    if (errors.length > 0) {
+      setImportError(errors.join(' '))
+      return
+    }
+
+    const binaryIds = created
+      .filter((channel) => isBinarySignal(channel.data))
+      .map((channel) => channel.id)
+
+    setImportedChannels((prev) => [...prev, ...created])
+    setSelectedChannels((prev) => [...prev, ...created.map((channel) => channel.id)])
+    if (binaryIds.length > 0) {
+      setChannelFormats((prev) => {
+        const next = { ...prev }
+        binaryIds.forEach((id) => {
+          next[id] = DEPICTION_FORMATS.BINARY_MASK
+        })
+        return next
+      })
+      setBinaryMaskOverlays((prev) => {
+        const next = { ...prev }
+        const nextFormats = { ...channelFormats }
+        binaryIds.forEach((id) => {
+          nextFormats[id] = DEPICTION_FORMATS.BINARY_MASK
+        })
+        binaryIds.forEach((id) => {
+          next[id] = getDefaultBinaryMaskOverlayTargets(id, selectedChannels, nextFormats)
+        })
+        return next
+      })
+    }
+
+    setPendingImportColumns([])
+    setImportError('')
   }
 
   const signalChannelCount = visibleFileChannels.length + importedChannels.length
@@ -3654,7 +3873,7 @@ const SignalViewer = ({ edfData, onBack }) => {
   }, [overviewStripLayout, overviewChannel])
 
   const handleChannelYZoomWheel = useCallback((event, channelId) => {
-    if (!channelById[channelId] && channelId !== OVERLAY_RANGE_KEY) return
+    if (!channelById[channelId] && !isOverlayRangeKey(channelId)) return
 
     const zoomFactor = Y_WHEEL_ZOOM_BASE ** (-event.deltaY / 100)
     const display = readChannelDisplayRange(channelId)
@@ -3806,11 +4025,11 @@ const SignalViewer = ({ edfData, onBack }) => {
         : selectedChannelsRef.current
       let next = orderIds
 
-      if (drag.channelId === OVERLAY_RANGE_KEY) {
-        const fromStripIndex = strips.findIndex((strip) => strip.kind === 'overlay')
+      if (isOverlayRangeKey(drag.channelId)) {
+        const fromStripIndex = strips.findIndex((strip) => strip.key === drag.channelId)
         if (fromStripIndex === -1 || targetStrip.kind === 'overlay' || fromStripIndex === targetStripIndex) return
 
-        const memberIds = overlayMemberIdsRef.current
+        const memberIds = strips[fromStripIndex].channels.map((member) => member.id)
         const memberSet = new Set(memberIds)
         const rest = orderIds.filter((id) => !memberSet.has(id))
         const targetId = targetStrip.channels[0].id
@@ -3821,7 +4040,7 @@ const SignalViewer = ({ edfData, onBack }) => {
         next = moveChannelBlock(orderIds, memberIds, insertAt)
       } else {
         const targetId = targetStrip.channels[0].id
-        const fromIndex = orderIds.indexOf(drag.channelId)
+        const fromIndex = orderIds.indexOf(Number(drag.channelId))
         const toIndex = orderIds.indexOf(targetId)
         if (fromIndex === -1 || toIndex === -1 || fromIndex === toIndex) return
         next = reorderArray(orderIds, fromIndex, toIndex)
@@ -3837,8 +4056,7 @@ const SignalViewer = ({ edfData, onBack }) => {
         temporaryChannelIdsRef.current = next
         displayStripsRef.current = buildDisplayStrips(
           channels,
-          overlayMemberIdsRef.current,
-          composeModeRef.current
+          overlayGroupsRef.current
         )
         setTemporaryChannelIds(next)
         return
@@ -3846,11 +4064,10 @@ const SignalViewer = ({ edfData, onBack }) => {
 
       selectedChannelsRef.current = next
       activeChannelsRef.current = channels
-      if (drag.channelId === OVERLAY_RANGE_KEY) {
+      if (isOverlayRangeKey(drag.channelId)) {
         displayStripsRef.current = buildDisplayStrips(
           channels,
-          overlayMemberIdsRef.current,
-          COMPOSE_MODES.OVERLAY
+          overlayGroupsRef.current
         )
       }
       setSelectedChannels(next)
@@ -3986,7 +4203,7 @@ const SignalViewer = ({ edfData, onBack }) => {
       pointerId: event.pointerId,
       startX: event.clientX,
       startY: event.clientY,
-      channelId: strip.kind === 'overlay' ? OVERLAY_RANGE_KEY : channel.id,
+      channelId: strip.kind === 'overlay' ? strip.key : channel.id,
       moved: false,
     }
 
@@ -4396,7 +4613,7 @@ const SignalViewer = ({ edfData, onBack }) => {
                               ? undefined
                               : (event) => handleChannelYRangeContextMenu(
                                 event,
-                                isOverlay ? OVERLAY_RANGE_KEY : channel.id
+                                isOverlay ? strip.key : channel.id
                               )
                           }
                         >
@@ -4410,10 +4627,10 @@ const SignalViewer = ({ edfData, onBack }) => {
                       const channel = strip.channels[0]
                       const isOverlay = strip.kind === 'overlay'
                       const isBinaryMask = !isOverlay && getChannelFormat(channel.id) === DEPICTION_FORMATS.BINARY_MASK
-                      const rangeKey = isOverlay ? OVERLAY_RANGE_KEY : channel.id
+                      const rangeKey = isOverlay ? strip.key : channel.id
                       const yZoom = channelYZoom[rangeKey] ?? DEFAULT_Y_ZOOM
                       const hasCustomRange = Boolean(channelYRange[rangeKey])
-                      const isDragging = reorderingChannelId === (isOverlay ? OVERLAY_RANGE_KEY : channel.id)
+                      const isDragging = reorderingChannelId === rangeKey
                       const isPanning = panningYCenterChannelId === rangeKey
                       const labelText = isOverlay
                         ? strip.channels.map((member) => member.label).join(', ')
@@ -4447,7 +4664,7 @@ const SignalViewer = ({ edfData, onBack }) => {
                             aria-label={`Reorder ${labelText}`}
                             onPointerDown={(event) => startChannelReorder(
                               event,
-                              isOverlay ? OVERLAY_RANGE_KEY : channel.id
+                              rangeKey
                             )}
                           >
                             ⋮⋮
@@ -4543,7 +4760,7 @@ const SignalViewer = ({ edfData, onBack }) => {
                     totalDuration={totalDuration}
                     initialViewStart={viewStart}
                     initialWindowSeconds={windowSeconds}
-                    shareScale={composeMode === COMPOSE_MODES.OVERLAY}
+                    shareScale={compareShareScale}
                     onClose={() => setCompareMode(false)}
                   />
                 ) : null}
@@ -4832,14 +5049,14 @@ const SignalViewer = ({ edfData, onBack }) => {
                 <h3>Import Data</h3>
                 <p className="parquet-import-hint">
                   Load numeric Parquet columns onto this recording. Sample 0 shares time zero
-                  with the EDF. The sample rate is read from the file name (for example 2hz)
-                  unless you set one here.
+                  with the EDF. After choosing files, set a sample rate for each column.
+                  Filename rates (for example 2hz) and the override below pre-fill those fields.
                 </p>
               </div>
 
               <div className="parquet-import-controls">
                 <label className="parquet-import-rate" htmlFor="parquet-sample-rate">
-                  Sample rate override (Hz)
+                  Default sample rate (Hz)
                   <input
                     id="parquet-sample-rate"
                     className="parquet-import-rate-input"
@@ -4851,12 +5068,21 @@ const SignalViewer = ({ edfData, onBack }) => {
                     placeholder="from filename"
                   />
                 </label>
+                <button
+                  type="button"
+                  className="btn btn-secondary"
+                  disabled={pendingImportColumns.length === 0 || !String(importSampleRate).trim()}
+                  onClick={handleApplyDefaultRateToPending}
+                >
+                  Apply to selected
+                </button>
                 <label className="btn btn-primary parquet-import-file">
-                  Choose Parquet
+                  {isLoadingParquet ? 'Reading…' : 'Choose Parquet'}
                   <input
                     type="file"
                     accept=".parquet,application/vnd.apache.parquet"
                     multiple
+                    disabled={isLoadingParquet}
                     onChange={handleImportParquetFiles}
                   />
                 </label>
@@ -4864,32 +5090,97 @@ const SignalViewer = ({ edfData, onBack }) => {
 
               {importError ? <p className="parquet-import-error">{importError}</p> : null}
 
-              {importedChannels.length === 0 ? (
-                <p className="parquet-import-empty">No imported series yet.</p>
-              ) : (
-                <ul className="parquet-import-list">
-                  {importedChannels.map((channel) => (
-                    <li key={channel.id} className="parquet-import-item">
-                      <div className="parquet-import-info">
-                        <span className="parquet-import-name">{channel.label}</span>
-                        <span className="parquet-import-meta">
-                          {channel.sourceFileName}
-                          {' · '}
-                          {channel.data.length.toLocaleString()} samples
-                          {' · '}
-                          {channel.sampleRate} Hz
-                        </span>
-                      </div>
+              {pendingImportColumns.length > 0 ? (
+                <div className="parquet-import-pending">
+                  <div className="parquet-import-pending-header">
+                    <h4>Pending columns</h4>
+                    <div className="parquet-import-pending-actions">
                       <button
                         type="button"
                         className="btn btn-secondary btn-small"
-                        onClick={() => handleRemoveChannel(channel.id)}
+                        onClick={handleClearPendingImport}
                       >
-                        Remove
+                        Clear
                       </button>
-                    </li>
-                  ))}
-                </ul>
+                      <button
+                        type="button"
+                        className="btn btn-primary btn-small"
+                        onClick={handleConfirmPendingImport}
+                      >
+                        Import selected
+                      </button>
+                    </div>
+                  </div>
+                  <ul className="parquet-import-list">
+                    {pendingImportColumns.map((column) => (
+                      <li key={column.key} className="parquet-import-item parquet-import-item-pending">
+                        <label className="parquet-import-include">
+                          <input
+                            type="checkbox"
+                            checked={column.included}
+                            onChange={(event) => handlePendingIncludedChange(column.key, event.target.checked)}
+                          />
+                          <span className="parquet-import-info">
+                            <span className="parquet-import-name">{column.label}</span>
+                            <span className="parquet-import-meta">
+                              {column.fileName}
+                              {' · '}
+                              {column.data.length.toLocaleString()} samples
+                            </span>
+                          </span>
+                        </label>
+                        <label className="parquet-import-rate parquet-import-rate-inline">
+                          Hz
+                          <input
+                            className="parquet-import-rate-input"
+                            type="number"
+                            min="0"
+                            step="any"
+                            disabled={!column.included}
+                            value={column.sampleRateText}
+                            onChange={(event) => handlePendingSampleRateChange(column.key, event.target.value)}
+                            placeholder="required"
+                          />
+                        </label>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
+
+              {importedChannels.length === 0 ? (
+                pendingImportColumns.length === 0 ? (
+                  <p className="parquet-import-empty">No imported series yet.</p>
+                ) : null
+              ) : (
+                <div className="parquet-import-imported">
+                  {pendingImportColumns.length > 0 ? (
+                    <h4 className="parquet-import-section-title">Imported</h4>
+                  ) : null}
+                  <ul className="parquet-import-list">
+                    {importedChannels.map((channel) => (
+                      <li key={channel.id} className="parquet-import-item">
+                        <div className="parquet-import-info">
+                          <span className="parquet-import-name">{channel.label}</span>
+                          <span className="parquet-import-meta">
+                            {channel.sourceFileName}
+                            {' · '}
+                            {channel.data.length.toLocaleString()} samples
+                            {' · '}
+                            {channel.sampleRate} Hz
+                          </span>
+                        </div>
+                        <button
+                          type="button"
+                          className="btn btn-secondary btn-small"
+                          onClick={() => handleRemoveChannel(channel.id)}
+                        >
+                          Remove
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
               )}
             </div>
           </div>

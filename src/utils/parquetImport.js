@@ -19,6 +19,32 @@ export function inferSampleRateFromFileName(fileName) {
 }
 
 /**
+ * Parse a positive sample-rate string from the import UI.
+ * @param {string} text
+ * @returns {number}
+ */
+export function parseSampleRateText(text) {
+  const rate = Number(String(text ?? '').trim())
+  if (!Number.isFinite(rate) || rate <= 0) {
+    throw new Error('Sample rate must be a positive number')
+  }
+  return rate
+}
+
+/**
+ * Default sample-rate text for a pending column: override, else filename Hz.
+ * @param {string} fileName
+ * @param {string} overrideText
+ * @returns {string}
+ */
+export function defaultImportSampleRateText(fileName, overrideText) {
+  const override = String(overrideText ?? '').trim()
+  if (override) return override
+  const inferred = inferSampleRateFromFileName(fileName)
+  return inferred ? String(inferred) : ''
+}
+
+/**
  * Filename rate, or a positive override from the import tab.
  * @param {string} fileName
  * @param {string} overrideText
@@ -26,13 +52,7 @@ export function inferSampleRateFromFileName(fileName) {
  */
 export function resolveImportSampleRate(fileName, overrideText) {
   const override = String(overrideText ?? '').trim()
-  if (override) {
-    const rate = Number(override)
-    if (!Number.isFinite(rate) || rate <= 0) {
-      throw new Error('Sample rate must be a positive number')
-    }
-    return rate
-  }
+  if (override) return parseSampleRateText(override)
 
   const inferred = inferSampleRateFromFileName(fileName)
   if (!inferred) {
