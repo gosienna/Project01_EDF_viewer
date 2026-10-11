@@ -3,8 +3,11 @@ import {
   ANNOTATION_CHANNEL_ID_BASE,
   buildAnnotationChannels,
   buildDefaultAnnotationGroups,
+  collectVisibleAnnotationMarks,
   getUniqueAnnotationLabels,
+  nearestAnnotationEvent,
   normalizeAnnotationGroups,
+  paintAnnotationMarks,
   serializeAnnotationGroups,
 } from '../utils/annotationChannels'
 import { deleteViewPreset, listViewPresets, saveViewPreset, updateViewPresetById } from '../utils/viewPresets'
@@ -45,6 +48,7 @@ const BINARY_EPS = 1e-6
 const DEPICTION_FORMATS = {
   SEQUENCE: 'sequence',
   BINARY_MASK: 'binary_mask',
+  STEM: 'stem',
 }
 
 const COMPOSE_MODES = {
@@ -104,6 +108,10 @@ const SELECTION_HIGHLIGHT = 'rgba(102, 126, 234, 0.16)'
 const DEPICTION_OPTIONS = [
   { value: DEPICTION_FORMATS.SEQUENCE, label: 'Sequence' },
   { value: DEPICTION_FORMATS.BINARY_MASK, label: 'Binary mask' },
+]
+
+const ANNOTATION_DEPICTION_OPTIONS = [
+  { value: DEPICTION_FORMATS.STEM, label: 'Stem' },
 ]
 
 const DEFAULT_CHANNELS = ['spo2', 'ihr', 'resp_norm', 'temperature', 'actigraphy']
@@ -368,6 +376,20 @@ function getDefaultBinaryMaskOverlayTargets(channelId, selectedChannels, channel
   )
 }
 
+function defaultDepictionFormat(channel) {
+  return channel?.isAnnotationChannel ? DEPICTION_FORMATS.STEM : DEPICTION_FORMATS.SEQUENCE
+}
+
+function annotationMarksFor(channel, viewStart, viewEnd, plotWidth) {
+  return collectVisibleAnnotationMarks(
+    channel?.events,
+    viewStart,
+    viewEnd,
+    plotWidth,
+    channel?.maxEventDuration ?? 0
+  )
+}
+
 function mapOverlayIdsToLabels(overlayRecord, channelById) {
   const byLabel = {}
   Object.entries(overlayRecord ?? {}).forEach(([maskId, targetIds]) => {
@@ -473,6 +495,23 @@ function drawOverviewStrip(ctx, {
   ctx.stroke()
 
   clipToChannelStrip(ctx, padding.left, plotWidth, yTop, stripHeight)
+
+  if (format === DEPICTION_FORMATS.STEM || channel.isAnnotationChannel) {
+    const peak = channel.physicalMax > 0 ? channel.physicalMax : 1
+    const marks = annotationMarksFor(channel, 0, Math.max(totalDuration, 0), plotWidth)
+    paintAnnotationMarks(ctx, marks, {
+      mode: 'stem',
+      xLeft: padding.left,
+      plotWidth,
+      yTop,
+      yBottom,
+      yForValue: (value) => overviewTraceY(value, yTop, stripHeight, 0, peak),
+      strokeStyle: '#718096',
+      fillStyle: 'rgba(113, 128, 150, 0.28)',
+    })
+    ctx.restore()
+    return
+  }
 
   if (format === DEPICTION_FORMATS.BINARY_MASK) {
     const segments = getBinaryMaskSegments(channel.data, 0, channel.data.length, plotWidth)
@@ -613,6 +652,32 @@ function getChannelDisplayRange({
   channelYZoom,
   channelYRange,
 }) {
+  if (channel.isAnnotationChannel) {
+    const minVal = 0
+    const maxVal = channel.physicalMax > 0 ? channel.physicalMax : 1
+    const override = channelYRange[channel.id]
+    if (
+      override &&
+      Number.isFinite(override.min) &&
+      Number.isFinite(override.max) &&
+      override.min < override.max
+    ) {
+      return {
+        displayMin: override.min,
+        displayMax: override.max,
+        displayRange: override.max - override.min,
+        isCustom: true,
+        samples: [],
+      }
+    }
+    const yZoom = channelYZoom[channel.id] ?? DEFAULT_Y_ZOOM
+    return {
+      ...getVisibleValueRange(minVal, maxVal, yZoom),
+      isCustom: false,
+      samples: [],
+    }
+  }
+
   const startSample = viewStart * channel.sampleRate
   const endSample = viewEnd * channel.sampleRate
   const samples = downsampleRange(channel.data, startSample, endSample, plotWidth)
@@ -761,7 +826,8 @@ function channelColorIndex(channel, activeChannels) {
 }
 
 function formatCursorTime(time, sampleRate) {
-  const step = sampleRate > 0 ? 1 / sampleRate : 0.01
+  if (!(sampleRate > 0)) return `${Number(time).toFixed(4)} s`
+  const step = 1 / sampleRate
   const decimals = Math.min(3, Math.max(2, Math.ceil(-Math.log10(step) - 1e-9)))
   return `${time.toFixed(decimals)} s`
 }
@@ -827,8 +893,36 @@ function describeChannelValue(channel, time, options) {
     overview,
     colorChannels,
   } = options
-  const raw = readNearestSample(data, time, channel.sampleRate)
   const color = channelReadoutColor(channel, colorChannels)
+
+  if (channel.isAnnotationChannel) {
+    const event = nearestAnnotationEvent(
+      channel.events,
+      time,
+      channel.maxEventDuration ?? 0
+    )
+    const markerY = display && event
+      ? clampTraceY(
+        overview
+          ? overviewTraceY(event.value, yTop, stripHeight, display.displayMin, display.displayRange)
+          : detailTraceY(event.value, yBottom, stripHeight, display.displayMin, display.displayRange),
+        yTop,
+        yBottom
+      )
+      : null
+    const text = event
+      ? `${formatSignalValue(event.value)} at ${event.onset.toFixed(4)} s`
+      : '—'
+    return {
+      key: channel.id,
+      label: channel.label,
+      text,
+      color,
+      markerY,
+    }
+  }
+
+  const raw = readNearestSample(data, time, channel.sampleRate)
 
   if (isBinary) {
     return {
@@ -919,7 +1013,10 @@ function buildHoverReadout(pointer, context, overviewRangeCache) {
     const time = fraction * totalDuration
     const isBinary = getChannelFormat(overviewChannel.id) === DEPICTION_FORMATS.BINARY_MASK
     let display = null
-    if (!isBinary) {
+    if (overviewChannel.isAnnotationChannel) {
+      const peak = overviewChannel.physicalMax > 0 ? overviewChannel.physicalMax : 1
+      display = { displayMin: 0, displayMax: peak, displayRange: peak }
+    } else if (!isBinary) {
       const cacheKey = `${overviewChannel.id}:${overviewChannel.data?.length ?? 0}`
       if (overviewRangeCache.key !== cacheKey) {
         overviewRangeCache.key = cacheKey
@@ -1393,6 +1490,9 @@ function applyViewParams(params, edfData, totalDuration) {
   Object.entries(params.channelFormats ?? {}).forEach(([label, format]) => {
     const id = labelToId[label]
     if (id === undefined) return
+    const channel = allChannels.find((item) => item.id === id)
+    if (format === DEPICTION_FORMATS.STEM && !channel?.isAnnotationChannel) return
+    if (channel?.isAnnotationChannel && format !== DEPICTION_FORMATS.STEM) return
     if (format === DEPICTION_FORMATS.BINARY_MASK && !binaryChannelIds.has(id)) return
     formats[id] = format
   })
@@ -1401,7 +1501,9 @@ function applyViewParams(params, edfData, totalDuration) {
   Object.entries(params.binaryMaskOverlaysByLabel ?? {}).forEach(([maskLabel, targetLabels]) => {
     const maskId = labelToId[maskLabel]
     if (maskId === undefined) return
-    if ((formats[maskId] ?? DEPICTION_FORMATS.SEQUENCE) !== DEPICTION_FORMATS.BINARY_MASK) return
+    const maskChannel = allChannels.find((item) => item.id === maskId)
+    const format = formats[maskId] ?? defaultDepictionFormat(maskChannel)
+    if (format !== DEPICTION_FORMATS.BINARY_MASK && format !== DEPICTION_FORMATS.STEM) return
 
     const targetIds = (targetLabels ?? [])
       .map((label) => labelToId[label])
@@ -1691,7 +1793,11 @@ const SignalViewer = ({ edfData, onBack }) => {
         label: channel.isImported ? `${channel.label} (imported)` : channel.label,
         sampleRate: channel.sampleRate,
         data: maskOverrides[id] ?? channel.data ?? [],
-        isMask: (channelFormats[id] ?? DEPICTION_FORMATS.SEQUENCE) === DEPICTION_FORMATS.BINARY_MASK,
+        isMask: (channelFormats[id] ?? defaultDepictionFormat(channel)) === DEPICTION_FORMATS.BINARY_MASK,
+        isStem: (channelFormats[id] ?? defaultDepictionFormat(channel)) === DEPICTION_FORMATS.STEM,
+        events: channel.events ?? [],
+        maxEventDuration: channel.maxEventDuration ?? 0,
+        physicalMax: channel.physicalMax,
         color: CHANNEL_COLORS[colorIndex % CHANNEL_COLORS.length],
       }
     }).filter(Boolean)
@@ -2081,8 +2187,8 @@ const SignalViewer = ({ edfData, onBack }) => {
   )
 
   const getChannelFormat = useCallback(
-    (channelId) => channelFormats[channelId] ?? DEPICTION_FORMATS.SEQUENCE,
-    [channelFormats]
+    (channelId) => channelFormats[channelId] ?? defaultDepictionFormat(channelById[channelId]),
+    [channelFormats, channelById]
   )
 
   const overlayCandidateChannels = useMemo(
@@ -2116,9 +2222,10 @@ const SignalViewer = ({ edfData, onBack }) => {
       if (binaryMaskOverlays[maskChannelId]) {
         return binaryMaskOverlays[maskChannelId]
       }
+      if (getChannelFormat(maskChannelId) === DEPICTION_FORMATS.STEM) return []
       return getDefaultBinaryMaskOverlayTargets(maskChannelId, selectedChannels, channelFormats)
     },
-    [binaryMaskOverlays, selectedChannels, channelFormats]
+    [binaryMaskOverlays, selectedChannels, channelFormats, getChannelFormat]
   )
 
   const getMaskData = useCallback(
@@ -2347,10 +2454,14 @@ const SignalViewer = ({ edfData, onBack }) => {
         (strip) => strip.kind === 'overlay' && strip.key === channelId
       )
       if (!group) return null
-      const sequenceMembers = group.channels.filter(
-        (member) => getChannelFormat(member.id) !== DEPICTION_FORMATS.BINARY_MASK
-      )
-      const axisMembers = sequenceMembers.length > 0 ? sequenceMembers : group.channels
+      const sequenceMembers = group.channels.filter((member) => {
+        const memberFormat = getChannelFormat(member.id)
+        return memberFormat !== DEPICTION_FORMATS.BINARY_MASK
+          && memberFormat !== DEPICTION_FORMATS.STEM
+      })
+      const axisMembers = sequenceMembers.length > 0
+        ? sequenceMembers
+        : group.channels.filter((member) => getChannelFormat(member.id) !== DEPICTION_FORMATS.STEM)
       const plotWidth = getChannelPlotWidth()
       const { viewStart: rangeStart, viewEnd: rangeEnd } = viewRangeRef.current
       let minVal = Infinity
@@ -2758,6 +2869,77 @@ const SignalViewer = ({ edfData, onBack }) => {
       ),
     }))
 
+    const annotationOverlayLayers = drawnChannels
+      .filter((channel) => getChannelFormat(channel.id) === DEPICTION_FORMATS.STEM)
+      .map((channel) => ({
+        channel,
+        color: CHANNEL_COLORS[channelColorIndex(channel, drawnChannels) % CHANNEL_COLORS.length],
+        overlayTargets: getBinaryMaskOverlayTargets(channel.id),
+        marks: annotationMarksFor(channel, viewStart, viewEnd, plotWidth),
+      }))
+
+    const signalMarkerY = (signal, onset, yTop, yBottom, stripHeight, displayMin, displayRange) => {
+      const value = readNearestSample(signal.data, onset, signal.sampleRate)
+      if (value === null) return null
+      return clampTraceY(
+        detailTraceY(value, yBottom, stripHeight, displayMin, displayRange),
+        yTop,
+        yBottom
+      )
+    }
+
+    const paintAnnotationMarkerLayer = (
+      layer,
+      yTop,
+      yBottom,
+      stripHeight,
+      displayMin,
+      displayRange,
+      signal
+    ) => {
+      paintAnnotationMarks(ctx, layer.marks, {
+        mode: 'marker',
+        xLeft: padding.left,
+        plotWidth,
+        yTop,
+        yBottom,
+        yForValue: () => yTop,
+        yForOnset: signal
+          ? (mark) => signalMarkerY(signal, mark.onset, yTop, yBottom, stripHeight, displayMin, displayRange)
+          : undefined,
+        strokeStyle: layer.color,
+        fillStyle: hexToRgba(layer.color, 0.28),
+      })
+    }
+
+    const drawAnnotationMarkersForTargets = (
+      signals,
+      yTop,
+      yBottom,
+      stripHeight,
+      displayMin,
+      displayRange,
+      skipChannelIds
+    ) => {
+      const targetIds = new Set(signals.map((signal) => signal.id))
+      annotationOverlayLayers.forEach((layer) => {
+        if (skipChannelIds?.has(layer.channel.id)) return
+        signals.forEach((signal) => {
+          if (!layer.overlayTargets?.includes(signal.id)) return
+          if (!targetIds.has(signal.id)) return
+          paintAnnotationMarkerLayer(
+            layer,
+            yTop,
+            yBottom,
+            stripHeight,
+            displayMin,
+            displayRange,
+            signal
+          )
+        })
+      })
+    }
+
     let yOffset = getDetailChannelsTop()
 
     const drawSeriesStroke = (samples, yTop, yBottom, stripHeight, displayMin, displayRange, strokeStyle) => {
@@ -2783,10 +2965,14 @@ const SignalViewer = ({ edfData, onBack }) => {
 
     const drawOverlayStrip = (strip, yTop, yBottom, stripHeight) => {
       const rangeKey = strip.key
-      const sequenceMembers = strip.channels.filter(
-        (member) => getChannelFormat(member.id) !== DEPICTION_FORMATS.BINARY_MASK
-      )
-      const axisMembers = sequenceMembers.length > 0 ? sequenceMembers : strip.channels
+      const sequenceMembers = strip.channels.filter((member) => {
+        const memberFormat = getChannelFormat(member.id)
+        return memberFormat !== DEPICTION_FORMATS.BINARY_MASK
+          && memberFormat !== DEPICTION_FORMATS.STEM
+      })
+      const axisMembers = sequenceMembers.length > 0
+        ? sequenceMembers
+        : strip.channels.filter((member) => getChannelFormat(member.id) !== DEPICTION_FORMATS.STEM)
       let minVal = Infinity
       let maxVal = -Infinity
       const series = axisMembers.map((member) => {
@@ -2884,6 +3070,36 @@ const SignalViewer = ({ edfData, onBack }) => {
         drawSeriesStroke(samples, yTop, yBottom, stripHeight, displayMin, displayRange, color)
       })
 
+      strip.channels.forEach((member) => {
+        if (getChannelFormat(member.id) !== DEPICTION_FORMATS.STEM) return
+        const layer = annotationOverlayLayers.find((item) => item.channel.id === member.id)
+        if (!layer) return
+        if (series.length === 0) {
+          paintAnnotationMarkerLayer(layer, yTop, yBottom, stripHeight, displayMin, displayRange, null)
+          return
+        }
+        series.forEach(({ member: signal }) => {
+          paintAnnotationMarkerLayer(layer, yTop, yBottom, stripHeight, displayMin, displayRange, {
+            id: signal.id,
+            data: getMaskData(signal.id),
+            sampleRate: signal.sampleRate,
+          })
+        })
+      })
+      drawAnnotationMarkersForTargets(
+        series.map(({ member }) => ({
+          id: member.id,
+          data: getMaskData(member.id),
+          sampleRate: member.sampleRate,
+        })),
+        yTop,
+        yBottom,
+        stripHeight,
+        displayMin,
+        displayRange,
+        overlayMemberIds
+      )
+
       ctx.fillStyle = '#a0aec0'
       ctx.font = '10px Inter, sans-serif'
       ctx.textAlign = 'left'
@@ -2952,6 +3168,49 @@ const SignalViewer = ({ edfData, onBack }) => {
           color?.stroke
         )
       })
+
+      if (format === DEPICTION_FORMATS.STEM) {
+        const {
+          displayMin,
+          displayMax,
+          displayRange,
+          isCustom,
+        } = getChannelDisplayRange({
+          channel,
+          viewStart,
+          viewEnd,
+          plotWidth,
+          channelYZoom,
+          channelYRange,
+        })
+        const color = CHANNEL_COLORS[channelColorIndex(channel, drawnChannels) % CHANNEL_COLORS.length]
+        const marks = annotationOverlayLayers.find((item) => item.channel.id === channel.id)?.marks
+          ?? annotationMarksFor(channel, viewStart, viewEnd, plotWidth)
+        paintAnnotationMarks(ctx, marks, {
+          mode: 'stem',
+          xLeft: padding.left,
+          plotWidth,
+          yTop,
+          yBottom,
+          yForValue: (value) => detailTraceY(value, yBottom, stripHeight, displayMin, displayRange),
+          strokeStyle: color,
+          fillStyle: hexToRgba(color, 0.28),
+        })
+        const yZoom = channelYZoom[channel.id] ?? DEFAULT_Y_ZOOM
+        ctx.fillStyle = '#a0aec0'
+        ctx.font = '10px Inter, sans-serif'
+        ctx.textAlign = 'left'
+        ctx.textBaseline = 'top'
+        const zoomLabel = !isCustom && yZoom !== DEFAULT_Y_ZOOM ? ` · ${yZoom.toFixed(1)}x` : ''
+        const customLabel = isCustom ? ' · fixed' : ''
+        ctx.fillText(
+          `${displayMin.toFixed(1)} – ${displayMax.toFixed(1)}${zoomLabel}${customLabel}`,
+          padding.left + 4,
+          yTop + 4
+        )
+        ctx.restore()
+        return
+      }
 
       if (format === DEPICTION_FORMATS.BINARY_MASK) {
         const maskIndex = drawnBinaryMaskChannels.findIndex((maskChannel) => maskChannel.id === channel.id)
@@ -3043,6 +3302,19 @@ const SignalViewer = ({ edfData, onBack }) => {
       })
 
       ctx.stroke()
+
+      drawAnnotationMarkersForTargets(
+        [{
+          id: channel.id,
+          data: channel.data,
+          sampleRate: channel.sampleRate,
+        }],
+        yTop,
+        yBottom,
+        stripHeight,
+        displayMin,
+        displayRange
+      )
 
       ctx.fillStyle = '#a0aec0'
       ctx.font = '10px Inter, sans-serif'
@@ -3365,10 +3637,14 @@ const SignalViewer = ({ edfData, onBack }) => {
 
   const handleBinaryMaskOverlayToggle = (maskChannelId, targetChannelId, enabled) => {
     setBinaryMaskOverlays((prev) => {
-      const current = prev[maskChannelId] ?? getDefaultBinaryMaskOverlayTargets(
-        maskChannelId,
-        selectedChannels,
-        channelFormats
+      const current = prev[maskChannelId] ?? (
+        getChannelFormat(maskChannelId) === DEPICTION_FORMATS.STEM
+          ? []
+          : getDefaultBinaryMaskOverlayTargets(
+            maskChannelId,
+            selectedChannels,
+            channelFormats
+          )
       )
       const nextTargets = enabled
         ? [...new Set([...current, targetChannelId])]
@@ -3604,7 +3880,6 @@ const SignalViewer = ({ edfData, onBack }) => {
   const renderAnnotationChannelItem = (group, groupIndex, channel) => {
     const includedLabels = Object.entries(group.labels ?? {})
     const canSelect = Boolean(channel)
-    const isBinary = channel ? binaryChannelIds.has(channel.id) : false
     const format = channel
       ? getChannelFormat(channel.id)
       : DEPICTION_FORMATS.SEQUENCE
@@ -3662,8 +3937,9 @@ const SignalViewer = ({ edfData, onBack }) => {
           </button>
         </div>
         <span className="channel-meta">
-          {canSelect ? `${channel.sampleRate.toFixed(1)} Hz · annotation` : 'annotation · no labels yet'}
-          {isBinary ? ' · binary' : ''}
+          {canSelect
+            ? `${(channel.events?.length ?? 0).toLocaleString()} events · annotation`
+            : 'annotation · no labels yet'}
           {includedLabels.length > 0
             ? ` · ${includedLabels.map(([label, value]) => `${label}=${value}`).join(', ')}`
             : ''}
@@ -3675,30 +3951,21 @@ const SignalViewer = ({ edfData, onBack }) => {
             value={format}
             onChange={(e) => handleFormatChange(channel.id, e.target.value)}
             onClick={(e) => e.stopPropagation()}
-            title={isBinary ? 'Choose depiction format' : 'Binary mask requires 0/1 signal values'}
+            title="Stem plot places a vertical line at each annotation time"
           >
-            {DEPICTION_OPTIONS.map((option) => (
-              <option
-                key={option.value}
-                value={option.value}
-                disabled={
-                  option.value === DEPICTION_FORMATS.BINARY_MASK && !isBinary
-                }
-              >
+            {ANNOTATION_DEPICTION_OPTIONS.map((option) => (
+              <option key={option.value} value={option.value}>
                 {option.label}
-                {option.value === DEPICTION_FORMATS.BINARY_MASK && !isBinary
-                  ? ' (0/1 only)'
-                  : ''}
               </option>
             ))}
           </select>
         ) : null}
-        {canSelect && format === DEPICTION_FORMATS.BINARY_MASK ? (
+        {canSelect && format === DEPICTION_FORMATS.STEM ? (
           <div className="binary-mask-overlay-targets">
             <span className="binary-mask-overlay-label">Overlay on:</span>
             {overlayCandidateChannels.length === 0 ? (
               <span className="binary-mask-overlay-empty">
-                Select sequence channels to overlay this mask.
+                Select sequence channels to mark with this annotation.
               </span>
             ) : (
               overlayCandidateChannels.map((targetChannel) => (

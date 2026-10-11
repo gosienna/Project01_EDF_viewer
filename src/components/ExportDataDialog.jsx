@@ -155,7 +155,9 @@ function ExportDataDialog({
                   />
                   <span className="export-channel-label">{channel.label}</span>
                   <span className="export-channel-meta">
-                    {channel.sampleRate.toFixed(1)} Hz
+                    {channel.isAnnotationChannel
+                      ? `${(channel.events?.length ?? 0).toLocaleString()} events`
+                      : `${Number(channel.sampleRate).toFixed(1)} Hz`}
                     {channel.physicalDimension ? ` · ${channel.physicalDimension}` : ''}
                     {channel.isAnnotationChannel ? ' · annotation' : ''}
                     {channel.isImported ? ' · imported' : ''}

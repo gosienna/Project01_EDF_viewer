@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react'
+import { collectVisibleAnnotationMarks, paintAnnotationMarks } from '../utils/annotationChannels'
 
 const PAD = { top: 10, right: 16, bottom: 26, left: 108 }
 const MIN_WINDOW_SECONDS = 5
@@ -240,10 +241,18 @@ export default function ComparePopup({
     groups.forEach((group, index) => {
       const yTop = PAD.top + index * stripHeight
       const yBottom = yTop + stripHeight
-      const sequenceMembers = group.channels.filter((channel) => !channel.isMask)
-      const axisMembers = sequenceMembers.length > 0 ? sequenceMembers : group.channels
+      const sequenceMembers = group.channels.filter((channel) => !channel.isMask && !channel.isStem)
+      const axisMembers = sequenceMembers.length > 0 ? sequenceMembers : group.channels.filter((channel) => !channel.isStem)
       let minVal = Infinity
       let maxVal = -Infinity
+      if (axisMembers.length === 0) {
+        group.channels.forEach((channel) => {
+          if (!channel.isStem) return
+          const peak = channel.physicalMax > 0 ? channel.physicalMax : 1
+          if (0 < minVal) minVal = 0
+          if (peak > maxVal) maxVal = peak
+        })
+      }
       const series = axisMembers.map((channel) => {
         const samples = channel.isMask
           ? []
@@ -337,6 +346,46 @@ export default function ComparePopup({
         })
         ctx.stroke()
         ctx.globalAlpha = 1
+      })
+
+      const stemSharesAxis = axisMembers.length === 0
+      const signalChannels = group.channels.filter((item) => !item.isStem && !item.isMask && item.data?.length)
+      group.channels.forEach((channel) => {
+        if (!channel.isStem) return
+        const marks = collectVisibleAnnotationMarks(
+          channel.events,
+          viewStart,
+          viewEnd,
+          plotWidth,
+          channel.maxEventDuration ?? 0
+        )
+        const paintOnSignal = (signal) => {
+          paintAnnotationMarks(ctx, marks, {
+            mode: stemSharesAxis ? 'stem' : 'marker',
+            xLeft: PAD.left,
+            plotWidth,
+            yTop,
+            yBottom,
+            yForValue: (value) => yBottom - 8 - ((value - displayMin) / displayRange) * (stripHeight - 16),
+            yForOnset: signal
+              ? (mark) => {
+                const index = Math.round(mark.onset * signal.sampleRate)
+                const sampleIndex = Math.max(0, Math.min(signal.data.length - 1, index))
+                const value = signal.data[sampleIndex]
+                if (!Number.isFinite(value)) return null
+                const y = yBottom - 8 - ((value - displayMin) / displayRange) * (stripHeight - 16)
+                return Math.max(yTop + 2, Math.min(yBottom - 2, y))
+              }
+              : undefined,
+            strokeStyle: channel.color,
+            fillStyle: `${channel.color}47`,
+          })
+        }
+        if (stemSharesAxis || signalChannels.length === 0) {
+          paintOnSignal(null)
+          return
+        }
+        signalChannels.forEach((signal) => paintOnSignal(signal))
       })
 
       ctx.restore()

@@ -27,6 +27,18 @@ function buildChannelMap(edfData, extraChannels = []) {
 }
 
 function buildChannelExportPayload(channel, data) {
+  if (channel.isAnnotationChannel) {
+    return {
+      label: channel.label,
+      isAnnotationChannel: true,
+      events: (channel.events ?? []).map((event) => ({
+        time: event.onset,
+        duration: event.duration,
+        value: event.value,
+      })),
+    }
+  }
+
   return {
     label: channel.label,
     sampleRate: channel.sampleRate,
@@ -38,7 +50,7 @@ function buildChannelExportPayload(channel, data) {
     digitalMax: channel.digitalMax,
     transducer: channel.transducer,
     prefiltering: channel.prefiltering,
-    isAnnotationChannel: Boolean(channel.isAnnotationChannel),
+    isAnnotationChannel: false,
     isImported: Boolean(channel.isImported),
     data,
   }
@@ -79,25 +91,44 @@ function escapeCsvValue(value) {
 }
 
 function buildCsvExport(edfData, channelIds, getChannelData, channelById) {
-  const lines = ['channel,sample_index,time_seconds,value']
+  const includeEvents = channelIds.some((id) => channelById[id]?.isAnnotationChannel)
+  const lines = [
+    includeEvents
+      ? 'channel,sample_index,time_seconds,duration,value'
+      : 'channel,sample_index,time_seconds,value',
+  ]
 
   channelIds.forEach((id) => {
     const channel = channelById[id]
     if (!channel) return
+
+    if (channel.isAnnotationChannel) {
+      ;(channel.events ?? []).forEach((event) => {
+        const row = [
+          escapeCsvValue(channel.label),
+          '',
+          Number(event.onset).toFixed(6),
+          Number(event.duration) > 0 ? Number(event.duration).toFixed(6) : '0',
+          event.value,
+        ]
+        lines.push(row.join(','))
+      })
+      return
+    }
 
     const data = getChannelData(id)
     const sampleRate = channel.sampleRate
 
     for (let i = 0; i < data.length; i += 1) {
       const timeSeconds = sampleRate > 0 ? i / sampleRate : i
-      lines.push(
-        [
-          escapeCsvValue(channel.label),
-          i,
-          timeSeconds.toFixed(6),
-          data[i],
-        ].join(',')
-      )
+      const row = [
+        escapeCsvValue(channel.label),
+        i,
+        timeSeconds.toFixed(6),
+        data[i],
+      ]
+      if (includeEvents) row.splice(3, 0, '')
+      lines.push(row.join(','))
     }
   })
 
