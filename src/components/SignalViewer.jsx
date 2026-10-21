@@ -1289,10 +1289,67 @@ function downsampleRange(data, startIndex, endIndex, targetPoints) {
 function mapIdsToLabels(idRecord, channelById) {
   const byLabel = {}
   Object.entries(idRecord ?? {}).forEach(([id, value]) => {
+    if (isOverlayRangeKey(id)) return
     const label = channelById[id]?.label ?? channelById[Number(id)]?.label
     if (label) byLabel[label] = value
   })
   return byLabel
+}
+
+function isFixedDisplayRange(range) {
+  return Boolean(
+    range
+    && Number.isFinite(range.min)
+    && Number.isFinite(range.max)
+    && range.min < range.max
+  )
+}
+
+function overlayMemberIdsFromKey(key) {
+  if (typeof key !== 'string' || !key.startsWith(OVERLAY_RANGE_PREFIX)) return null
+  const memberIds = key.slice(OVERLAY_RANGE_PREFIX.length).split(',').map(Number)
+  if (memberIds.length < 2 || memberIds.some((id) => !Number.isFinite(id))) return null
+  return memberIds
+}
+
+function mapOverlayStripYRanges(channelYRange, channelById) {
+  const ranges = []
+  Object.entries(channelYRange ?? {}).forEach(([key, range]) => {
+    const memberIds = overlayMemberIdsFromKey(key)
+    if (!memberIds || !isFixedDisplayRange(range)) return
+    const labels = memberIds.map((id) => channelById[id]?.label)
+    if (labels.some((label) => !label)) return
+    ranges.push({
+      labels: [...labels].sort((a, b) => a.localeCompare(b)),
+      min: range.min,
+      max: range.max,
+    })
+  })
+  return ranges.sort((a, b) => a.labels.join('\0').localeCompare(b.labels.join('\0')))
+}
+
+function normalizeOverlayStripYRanges(ranges) {
+  return (ranges ?? [])
+    .map((entry) => ({
+      labels: [...(entry?.labels ?? [])].filter(Boolean).sort((a, b) => a.localeCompare(b)),
+      min: entry?.min,
+      max: entry?.max,
+    }))
+    .filter((entry) => entry.labels.length >= 2 && isFixedDisplayRange(entry))
+    .sort((a, b) => a.labels.join('\0').localeCompare(b.labels.join('\0')))
+}
+
+function resolveOverlayStripYRanges(ranges, labelToId, overlayGroups) {
+  const resolved = {}
+  normalizeOverlayStripYRanges(ranges).forEach((entry) => {
+    const ids = entry.labels.map((label) => labelToId[label])
+    if (ids.some((id) => id === undefined)) return
+    const key = getOverlayRangeKey(ids)
+    const matchesGroup = overlayGroups.some((group) => getOverlayRangeKey(group) === key)
+    if (!matchesGroup) return
+    resolved[key] = { min: entry.min, max: entry.max }
+  })
+  return resolved
 }
 
 function normalizeChannelLabelRecord(record) {
@@ -1394,6 +1451,7 @@ function buildViewParams({
     channelStripHeightsByLabel: mapIdsToLabels(channelStripHeights, channelById),
     channelYZoomByLabel: mapIdsToLabels(channelYZoom, channelById),
     channelYRangeByLabel: mapIdsToLabels(channelYRange, channelById),
+    overlayStripYRanges: mapOverlayStripYRanges(channelYRange, channelById),
     annotationGroups: serializeAnnotationGroups(normalizedGroups),
     windowSeconds,
     viewStart,
@@ -1427,6 +1485,7 @@ function normalizeViewParams(params) {
     channelStripHeightsByLabel: normalizeChannelLabelRecord(params.channelStripHeightsByLabel),
     channelYZoomByLabel: normalizeChannelLabelRecord(params.channelYZoomByLabel),
     channelYRangeByLabel: normalizeChannelLabelRecord(params.channelYRangeByLabel),
+    overlayStripYRanges: normalizeOverlayStripYRanges(params.overlayStripYRanges),
     annotationGroups: serializeAnnotationGroups(params.annotationGroups ?? []),
     windowSeconds: params.windowSeconds,
     viewStart: params.viewStart,
@@ -1561,6 +1620,7 @@ function applyViewParams(params, edfData, totalDuration) {
   }
 
   const overlayGroups = resolveOverlayGroupsFromParams(params, labelToId)
+  Object.assign(yRange, resolveOverlayStripYRanges(params.overlayStripYRanges, labelToId, overlayGroups))
 
   Object.entries(formats).forEach(([id, format]) => {
     if (format !== DEPICTION_FORMATS.BINARY_MASK) return
@@ -5174,7 +5234,7 @@ const SignalViewer = ({ edfData, onBack }) => {
                 <p className="view-presets-hint">
                   Save all viewer settings to IndexedDB: full sequence channel, channel order, channels,
                   depiction formats, overlay groups, binary mask overlays, time zoom, panel height, channel strip heights,
-                  Y-axis zoom, Y-axis value ranges, and active tab.
+                  Y-axis zoom, fixed display value ranges for each channel strip (including overlaid strips), and active tab.
                 </p>
               </div>
 
